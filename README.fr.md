@@ -13,10 +13,12 @@
 
 ## Comment ça marche
 
-- **Vision** : captures brutes par ADB, recherche de chaque bouton par template matching OpenCV avec vérification de la couleur et du contraste (`templates/`). Les positions trouvées sont retenues pour aller plus vite.
+- **Vision** : l'écran arrive en vidéo h264 depuis le serveur scrcpy, décodée avec PyAV : une image fraîche en ~50 ms au lieu de ~1,5 s par `adb screencap` (gardé en secours). Chaque bouton est cherché par template matching OpenCV avec vérification de la couleur et du contraste (`templates/`) ; il n'est touché que s'il est vu au même endroit sur deux images de suite, pour ne pas se faire piéger par les animations des menus. Taille et place des boutons trouvés sont retenues.
+- **Rendu à 50 %** : le jeu est passé en résolution 50 % (`cmd game set --downscale 0.5`) et y reste ; tous les templates sont faits pour ça.
 - **Doigts** : le serveur officiel de [scrcpy](https://github.com/Genymobile/scrcpy) (fourni dans `outils/`, Apache-2.0) est envoyé sur le téléphone et piloté directement : vrai pincement à deux doigts pour dézoomer (sans root), touches et glissements rapides. Repli sur `adb input` si besoin.
 - **Lecture des chiffres** : un petit OCR sur les chiffres du jeu pour lire le butin et les compteurs de troupes. Il passe les villages sous un seuil (`--butin`, or + élixir + 120 × élixir noir).
-- **Déploiement** : les cartes de la barre sont reconnues quel que soit le décor (les nouvelles sont apprises toutes seules) ; les bords de la carte sont cherchés une fois puis gardés dans `templates/carte.json` ; troupes, héros, engin et sorts (précipitation, rage) sont posés le long des bords, puis vérifiés et reposés jusqu'à ce que tout soit sorti.
+- **Déploiement** : les cartes de la barre sont reconnues quel que soit le décor (les nouvelles sont apprises toutes seules) ; les bords de la carte sont cherchés une fois puis gardés dans `templates/carte.json` ; troupes, héros et engin sont posés le long des bords, puis vérifiés et reposés jusqu'à ce que tout soit sorti. La base adverse est repérée sur l'image (texture des cases) avant toute pose, et les sorts (précipitation, rage) sont lancés dedans. La position de la caméra est mesurée à chaque attaque, car le jeu la décale jusqu'à ~180 px.
+- **Fenêtres imprévues** : les boutons de `templates/popups/` (OK, croix…) sont touchés quand une fenêtre inattendue apparaît.
 - **Base des ouvriers** (`--nuit`) : deux étapes, pose tout autour de la base adverse, compétence de chaque camp 5 s après sa pose, compétence du héros dès que sa jauge est pleine, et bouton ×4 touché seulement quand il affiche 1×.
 
 <p align="center"><img src="docs/bot-coc-run.png" width="820" alt="exemple"><br><sub>exemple de sortie</sub></p>
