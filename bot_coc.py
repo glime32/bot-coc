@@ -103,7 +103,7 @@ SORTS = TEMPLATES / "sorts"
 CARTES = TEMPLATES / "cartes"     # dessin de chaque carte de ton armée (appris tout seul)
 DEBUG = DOSSIER / "debug"
 
-ADB_SERIAL = None            # None = l'unique téléphone branché ; sinon son numéro, ex. "R5CXXXXXXXX"
+ADB_SERIAL = None            # None = l'unique téléphone branché ; sinon son numéro, ex. "R5CXXXXXXXX" (adb devices)
 GARDER_ECRAN_ALLUME = True   # écran du téléphone toujours allumé pendant le bot (rétabli à la fin)
 SEUIL = 0.80                 # confiance minimale pour reconnaître un bouton (0 à 1)
 SEUIL_POPUP = 0.92           # popups/*.png : touchés dès qu'ils sont vus, donc plus exigeant
