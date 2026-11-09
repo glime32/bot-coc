@@ -17,8 +17,11 @@
 - **50 % render**: the game is switched to 50 % resolution (`cmd game set --downscale 0.5`) and left there; every template is tuned for it.
 - **Fingers**: the official [scrcpy](https://github.com/Genymobile/scrcpy) server (bundled in `outils/`, Apache-2.0) is pushed to the phone and driven directly: real two-finger pinch to zoom out (no root), fast taps and swipes. Falls back to `adb input` if needed.
 - **Reading numbers**: a tiny OCR on the game's own digit glyphs to read loot and troop counts — skips villages below a loot threshold (`--butin`, gold + elixir + 120 × dark elixir).
-- **Deployment**: troop bar cards are recognized whatever the background (new cards are learned automatically); the map edges are probed once then saved in `templates/carte.json`; troops, heroes and siege machine are placed along the edges, then checked and redeployed until everything is out. The enemy base is located on the image (tile texture) before anything is placed, and spells (Haste, Rage) are cast inside it. The camera position is measured on every attack, since the game shifts it by up to ~180 px.
-- **Surprise pop-ups**: buttons in `templates/popups/` (OK, close…) are tapped when an unexpected window shows up.
+- **Deployment**: troop bar cards are recognized whatever the background (new cards are learned automatically); the map edges are probed once then saved in `templates/carte.json`; troops, heroes and siege machine are placed along the edges, then checked and redeployed until everything is out. The camera position is measured on every attack, since the game shifts it by up to ~180 px.
+- **Spells**: cast once every troop is out, during the battle, on the troop groups that move the most (three video frames 0.12 s apart, compared at quarter resolution): half from the bottom view, the rest from the top view. Every bar card is checked so a spell is never dropped as a troop.
+- **End of battle**: the bot surrenders when "Overall damage" hasn't changed for 6 s (and at least 20 s after deployment started) instead of waiting for the timer.
+- **Surprise pop-ups**: buttons in `templates/popups/` (OK, close…) are tapped when an unexpected window shows up. The "Rentrer" button of the opponent search screen is not one of them (it cancelled every search): it is only tapped after the screen has been frozen for 25 s.
+- **Light on the PC**: video is decoded at 10 fps (about 5 % of one core while waiting), and the bot runs on the efficiency cores of a hybrid Intel CPU (found automatically, `COEURS` setting at the top of the script), never on the first core. The adb server is moved to the same cores.
 - **Builder Base** (`--nuit`): two stages, deploys all around the enemy base, triggers each camp's ability 5 s after it lands, the hero ability whenever its gauge is full, and taps the ×4 speed button only when it shows 1×.
 
 <p align="center"><img src="docs/bot-coc-run.png" width="820" alt="example run"><br><sub>example output</sub></p>
@@ -27,7 +30,7 @@
 
 ```bash
 git clone https://github.com/glime32/bot-coc && cd bot-coc
-./install.sh                       # creates .venv with opencv-python + numpy
+./install.sh                       # creates .venv with opencv-python, numpy and PyAV
 ```
 
 Needs `adb` and an Android phone with **USB debugging** on. The bundled templates were captured on a French-language game at 2340×1080; for another language or screen, recreate them with `capture NOM`.

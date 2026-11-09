@@ -32,10 +32,10 @@ s'il ne l'est pas (le jeu redémarre) et l'y laisse (REMETTRE_A_LA_FIN pour reme
 
 Village principal : Combat → Trouver une partie → Attaquer → butin (Suivant si or + élixir +
 120 × élixir noir < 2,2 millions) → dézoom au maximum → vue haut (caméra en butée en haut à
-gauche) : moitié des troupes, une partie des héros sur les deux bords du haut, puis les sorts
-de ce côté DANS la base adverse (repérée sur l'image avant toute pose) → vue bas
+gauche) : moitié des troupes, une partie des héros sur les deux bords du haut → vue bas
 (en butée en bas à droite) : le reste → vérifications et reposes (héros et engin compris)
-jusqu'à ce que tout soit sorti → compétences des héros → vitesse ×4 dès que le bouton de
+jusqu'à ce que tout soit sorti → compétences des héros → sorts sur les groupes de troupes
+les plus nombreux (vue bas puis vue haut) → vitesse ×4 dès que le bouton de
 vitesse apparaît (au bout de 2 minutes) → Rentrer dès la fin.
 Au tout premier combat, le bot cherche les bords de la carte (une troupe à la fois, de
 l'extérieur vers l'intérieur) puis les garde dans templates/carte.json.
@@ -84,6 +84,35 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+# Cœurs du processeur où tourne le bot. None : les cœurs économes (4 à 7 sur ce PC : moins de
+# batterie, ~0,1 s de plus par attaque), jamais le premier, déjà le plus chargé. Pour aller un
+# peu plus vite sur les cœurs performants sans le premier : COEURS = {1, 2, 3}
+COEURS = None
+
+
+def coeurs_du_bot():
+    """Les cœurs choisis : COEURS, sinon les cœurs économes s'il y en a (Intel hybride), sinon
+    tous ; jamais le premier."""
+    tous = os.sched_getaffinity(0)
+    if COEURS:
+        return (set(COEURS) & tous) or tous
+    econes = set()
+    try:
+        for morceau in Path("/sys/devices/cpu_atom/cpus").read_text().strip().split(","):
+            a, _, b = morceau.partition("-")
+            econes.update(range(int(a), int(b or a) + 1))
+    except (OSError, ValueError):
+        pass
+    return (econes & tous) - {0} or tous - {0} or tous
+
+
+# Avant numpy et OpenCV : leurs fils de calcul, et ceux du décodage vidéo, héritent du réglage.
+try:
+    os.sched_setaffinity(0, coeurs_du_bot())
+except (AttributeError, OSError):
+    pass
+
 import cv2
 import numpy as np
 
@@ -124,12 +153,15 @@ SCRCPY_VERSION = "5.0.1"
 DOIGTS_SCRCPY = True
 APPUI = 0.018                # durée d'une touche (s)
 ECART_TOUCHES = 0.022        # pause entre deux touches (s)
-PINCEMENTS = 4               # pincements pour dézoomer à fond (un ou deux ne suffisent pas toujours)
+PINCEMENTS = 2               # pincements pour dézoomer à fond (mesuré : un seul suffit déjà)
+PINCEMENT_DUREE = 0.14       # s par pincement (4 × 0,28 s avant : 2,0 s de dézoom, 0,6 s maintenant)
 
-# Images de l'écran : vidéo du serveur scrcpy (~5 ms par image fraîche, ~2 % d'un cœur du PC)
-# au lieu de « adb screencap » (~1,5 s). Il faut PyAV : .venv/bin/pip install av
+# Images de l'écran : vidéo du serveur scrcpy (une image fraîche en ~50 ms, ~5 % d'un cœur du PC
+# à 10 images/s) au lieu de « adb screencap » (~1,5 s). Il faut PyAV : .venv/bin/pip install av
+# (Mesuré : le décodage matériel VAAPI ne coûte pas moins à cette résolution, 2,1 contre 2,2 ms
+# par image, à cause de la copie de chaque image vers la mémoire du processeur.)
 VIDEO_SCRCPY = True
-VIDEO_IPS = 20               # images par seconde (une image fraîche arrive en 50 ms au plus)
+VIDEO_IPS = 10               # images par seconde (20 : 8 % d'un cœur au lieu de 5 %, pour 25 ms de gagnées)
 VIDEO_DEBIT = 8_000_000      # bits/s : assez pour que les images valent une capture d'écran
 
 # Résolution du jeu. Tout le bot (boutons, chiffres, cartes, bords de la carte) est réglé sur le
@@ -151,13 +183,13 @@ MEMO_RESOLUTION = DOSSIER / "resolution_a_remettre.txt"   # présent = le bot do
 CARTE_JSON = TEMPLATES / "carte.json"
 BARRE = (0.80, 1.0)          # bande verticale où se trouve la barre des troupes
 
-# Sorts : DANS la base adverse (repérée sur l'image : bâtiments et murs contre sol nu), au
-# milieu de chaque côté puis aux coins, là où les troupes arrivent. Ils partent juste après les
-# troupes de la même vue : le temps qu'elles marchent jusqu'à la base, le sort les attend.
-SORTS_AVANT_TROUPES = False  # True : sorts juste avant les troupes ; False : juste après
-PRECIPITATION_DEDANS = 2.5   # précipitation : à 2,5 cases à l'intérieur du bord de la base
-RAGE_DEDANS = 4.5            # rage : à 4,5 cases à l'intérieur (là où les troupes se battent)
-ORDRE_SORTS = ("gh", "db", "dh", "gb", "h", "b", "g", "d")   # côtés d'abord, en alternant haut/bas
+# Sorts : une fois toutes les troupes posées, là où il y en a le plus. Le bot compare trois
+# images rapprochées : ce qui bouge, ce sont les troupes (les bâtiments restent immobiles). La
+# moitié des sorts part dans la vue bas, l'autre dans la vue haut, chacun sur un groupe
+# différent. Ça se passe pendant le combat, quand le bot attend de toute façon.
+SORTS_APRES = 2.5            # s après la dernière troupe posée : le temps qu'elles arrivent à la base
+SORT_RAYON = 3.5             # rayon pris en compte autour de chaque sort (cases)
+SORT_DENSITE_MIN = 0.02      # part minimale de pixels qui bougent pour viser un groupe
 RAFALE = 40                  # touches envoyées d'un coup, entre deux vérifications rapides
 EXTRA = 2                    # touches en plus quand on repose des troupes, pour être sûr qu'elles sortent
 
@@ -174,6 +206,12 @@ FACULTATIFS = ("attaquer",)
 # dans les deux villages. Le bot le touche quand il affiche 1x (le combat passe en ×4), jamais
 # quand il affiche 4x (ce serait revenir en ×1).
 VITESSE_APRES = 100.0        # s de combat avant de commencer à le guetter
+
+# Capitulation quand plus rien n'avance : si les « Dégâts généraux » n'ont pas bougé depuis
+# CAPITULER_SI_FIGE s (et pas avant CAPITULER_APRES_MIN s après le début de la pose), le bot
+# capitule sans attendre la fin du combat ni --duree. None : jamais.
+CAPITULER_SI_FIGE = 6.0
+CAPITULER_APRES_MIN = 20.0
 VITESSE_PERIODE = 3.0        # s entre deux coups d'œil tant qu'il n'est pas sur 4x
 
 # Base des ouvriers (--nuit)
@@ -230,7 +268,7 @@ class Carte:
 
     def decrire(self):
         if self.sort:
-            return f"{self.sort} x{self.nombre}"
+            return f"{self.sort} x{self.nombre or '?'}"
         if self.nombre:
             return f"x{self.nombre}"
         return "héros" if self.heros else "unité"
@@ -571,6 +609,7 @@ class Telephone:
         self.dims = None          # (largeur, hauteur) de la dernière capture complète
         self.bandes = True        # passe à False si le téléphone ne sait pas couper la capture
         self.temps = {"video": [0.0, 0], "capture": [0.0, 0], "bande": [0.0, 0], "touches": [0.0, 0]}
+        self.ranger_serveur_adb()
         self.relances = 0         # redémarrages du serveur scrcpy après une coupure
         self.tactile = None       # écran tactile (ancien geste sendevent), lu au premier besoin
         self.canal = None         # doigts simulés par le serveur de scrcpy, lancés au premier besoin
@@ -584,6 +623,18 @@ class Telephone:
                 self.ancien_reglage = valeur
                 self.shell("svc power stayon true")
             self.shell("input keyevent KEYCODE_WAKEUP")
+
+    @staticmethod
+    def ranger_serveur_adb():
+        """Le serveur adb (il transporte la vidéo) sur les mêmes cœurs que le bot. Lancé par le
+        bot, il en hérite ; déjà lancé avant, on le déplace."""
+        try:
+            pids = subprocess.run(["pgrep", "-f", "adb .*fork-server server"], capture_output=True,
+                                  text=True).stdout.split()
+            for pid in pids:
+                os.sched_setaffinity(int(pid), os.sched_getaffinity(0))
+        except (OSError, ValueError):
+            pass
 
     def shell(self, commande):
         try:
@@ -743,7 +794,7 @@ class Telephone:
             fixe, loin, pres = (0.50 * w, 0.45 * h), (0.88 * w, 0.45 * h), (0.56 * w, 0.45 * h)
             debut, fin = (loin, pres) if dezoom else (pres, loin)
             try:
-                canal.pincer(fixe, debut, fin)
+                canal.pincer(fixe, debut, fin, duree=PINCEMENT_DUREE, pas=6)
                 return True
             except OSError as e:
                 self._canal_perdu(e)
@@ -1194,10 +1245,11 @@ def lignes_de(nom, marge=12):
     return int(y / REDUCTION) - marge, int((y + th) / REDUCTION) + marge
 
 
-def attendre(tel, cibles, delai, en_route=(), pas=0.2):
+def attendre(tel, cibles, delai, en_route=(), pas=0.2, patients=None):
     """Capture en boucle jusqu'à voir l'un des templates `cibles`. En attendant,
     touche les popups connus puis les boutons `en_route` (dans cet ordre de priorité), une
-    fois l'écran posé (bouton vu deux fois de suite au même endroit).
+    fois l'écran posé (bouton vu deux fois de suite au même endroit). `patients` : boutons
+    touchés seulement s'ils restent affichés tant de secondes ({nom: secondes}).
     Quand on sait déjà où sont tous ces boutons, on ne capture que leurs lignes
     (beaucoup plus rapide), avec une capture complète de temps en temps par sécurité."""
     fin = time.monotonic() + delai
@@ -1205,6 +1257,7 @@ def attendre(tel, cibles, delai, en_route=(), pas=0.2):
     ecran, tour = None, 0
     noms = [*cibles, *en_route, *popups()]
     vus = {}                    # boutons vus au tour précédent (pour ne pas toucher pendant une animation)
+    depuis = {}                 # boutons « patients » : affichés sans interruption depuis quand
     while time.monotonic() < fin:
         lignes = [lignes_de(n) for n in noms]
         if tour % 5 and all(lignes):
@@ -1230,6 +1283,14 @@ def attendre(tel, cibles, delai, en_route=(), pas=0.2):
                 derniere_touche[nom] = time.monotonic()
             break
         vus = nouveaux
+        for nom, duree in (patients or {}).items():
+            t = localiser(ecran, nom)
+            if not t:
+                depuis.pop(nom, None)
+            elif time.monotonic() - depuis.setdefault(nom, time.monotonic()) >= duree:
+                log(f"  → {nom} (affiché depuis {duree:g} s)")
+                tel.toucher((t.x, t.y))
+                depuis.pop(nom)
         time.sleep(pas)
     raise Bloque(f"« {' / '.join(cibles)} » n'est pas apparu en {delai} s", ecran)
 
@@ -1361,6 +1422,37 @@ def lignes_butin(ecran):
     return lignes
 
 
+def rogner(mk):
+    """Masque débarrassé de ses lignes et colonnes vides."""
+    lignes, colonnes = np.flatnonzero(mk.any(axis=1)), np.flatnonzero(mk.any(axis=0))
+    if not len(lignes) or not len(colonnes):
+        return mk
+    return mk[lignes[0]:lignes[-1] + 1, colonnes[0]:colonnes[-1] + 1]
+
+
+def lire_chiffres(masques):
+    """[(chiffre, score)] des masques de glyphes(). Un glyphe large et mal reconnu est essayé
+    coupé en deux à chaque colonne : deux chiffres collés, comme le « 19 » de « 194 048 » (un
+    « 1 » est si fin que la paire ne paraît pas assez large pour être coupée d'office)."""
+    sortie = []
+    for m in masques:
+        lu = reconnaitre(m, "0123456789")
+        h, w = m.shape
+        if lu[1] < 0.65 and w > 0.9 * h:
+            meilleure = None
+            for x in range(int(0.2 * w), int(0.8 * w) + 1):
+                g, d = rogner(m[:, :x]), rogner(m[:, x:])
+                if g.size and d.size:
+                    paire = [reconnaitre(g, "0123456789"), reconnaitre(d, "0123456789")]
+                    if meilleure is None or min(sc for _, sc in paire) > min(sc for _, sc in meilleure):
+                        meilleure = paire
+            if meilleure and min(sc for _, sc in meilleure) >= 0.65:
+                sortie += meilleure
+                continue
+        sortie.append(lu)
+    return sortie
+
+
 def lire_butin(ecran):
     """Butin disponible affiché en haut à gauche pendant l'observation, ou None."""
     lignes = lignes_butin(ecran)
@@ -1368,7 +1460,7 @@ def lire_butin(ecran):
         return None
     valeurs = []
     for k, masques in enumerate(lignes):
-        lus = [reconnaitre(m, "0123456789") for m in masques]
+        lus = lire_chiffres(masques)
         if lus and min(sc for _, sc in lus) >= 0.65:
             valeurs.append(int("".join(c for c, _ in lus)))
         elif k == 2:
@@ -1376,6 +1468,17 @@ def lire_butin(ecran):
         else:
             return None
     return Butin(*valeurs)
+
+
+def lire_degats(ecran):
+    """« Dégâts généraux » (0 à 100) affichés en bas à droite pendant un combat, ou None."""
+    w, h = ecran.w, ecran.h
+    roi = ecran.img[int(0.722 * h):int(0.780 * h), int(0.885 * w):int(0.956 * w)]
+    lus = lire_chiffres(glyphes(roi, 0.042 * h))
+    if not lus or min(s for _, s in lus) < 0.65:
+        return None
+    valeur = int("".join(c for c, _ in lus))
+    return valeur if valeur <= 100 else None
 
 
 def lire_compteur(ecran, carte):
@@ -1698,8 +1801,8 @@ def analyser_cartes(ecran, cartes):
     """Avant toute touche : compteur de chaque carte, sorts, héros, aspect de départ."""
     for c in cartes:
         c.nombre = lire_compteur(ecran, c)
-        c.sort = identifier_sort(ecran, c) if c.nombre else None
-        c.heros = c.nombre is None and cadre_heros(ecran, c)
+        c.sort = identifier_sort(ecran, c)       # même sans compteur lisible : jamais une unité
+        c.heros = c.nombre is None and not c.sort and cadre_heros(ecran, c)
         c.bande0 = bande_dessus(ecran, c).astype(np.int16)
         c.motif0 = c.nombre is None and motif_pose(ecran, c)   # le décor imite déjà une barre de vie
 
@@ -1758,7 +1861,6 @@ class Plan:
         ew, eh = self.d["ecran"]
         self.kx, self.ky = w / ew, h / eh
         self.decalage = list(self.d["decalage_bas"])     # corrigé si la vue bas est mesurée
-        self.cibles_sorts = {}                           # cases visées par les sorts (recaler_sorts)
 
     def sauver(self):
         CARTE_JSON.write_text(json.dumps(self.d, indent=2, ensure_ascii=False))
@@ -1816,93 +1918,6 @@ class Plan:
                 points.append((int(round(x)), int(round(y))))
         return points
 
-    def vers_centre(self, p, t=None, cases=None):
-        ic, jc = self.centre()
-        di, dj = ic - p[0], jc - p[1]
-        if cases is not None:
-            t = cases / max(1e-6, float(np.hypot(di, dj)))
-        return p[0] + di * t, p[1] + dj * t
-
-    def taille_grille(self):
-        b = self.d["bords"]
-        return int(round(b["i1"] - b["i0"])), int(round(b["j1"] - b["j0"]))
-
-    def ecran_grille(self, vue):
-        """Points d'écran (x, y) du centre de toutes les cases (n, m) de la carte : deux
-        tableaux N × M (n = 0 au bord haut-droite, m = 0 au bord haut-gauche)."""
-        b = self.d["bords"]
-        N, M = self.taille_grille()
-        n, m = np.mgrid[0:N, 0:M]
-        i, j = b["i0"] + 0.5 + n, b["j0"] + 0.5 + m
-        sx, sy = self.d["sommet"]
-        a, bb = self.d["case"]
-        x, y = sx - a * i + a * j, sy + bb * i + bb * j
-        if vue == "bas":
-            x, y = x + self.decalage[0], y + self.decalage[1]
-        return x * self.kx, y * self.ky
-
-    def base_par_defaut(self):
-        """Faute de mieux : la carte sans la bande de pose et 3 cases de plus."""
-        N, M = self.taille_grille()
-        return {"n0": 6, "n1": N - 7, "m0": 6, "m1": M - 7, "trouvee": False}
-
-    def bords_base(self, base):
-        """(i haut-droite, i bas-gauche, j haut-gauche, j bas-droite) des bords de la base."""
-        b = self.d["bords"]
-        return (b["i0"] + base["n0"], b["i0"] + base["n1"] + 1,
-                b["j0"] + base["m0"], b["j0"] + base["m1"] + 1)
-
-    def place_dans_base(self, p, vue, zones, centre, vues=None):
-        """(vue, point d'écran, case) où lancer un sort visé sur la case p, dans la vue
-        prévue de préférence. Si l'endroit est caché (barre, boutons, affichages), on le
-        rapproche du centre de la base (de moitié au plus), puis on essaie l'autre vue."""
-        for v in vues or (vue, "bas" if vue == "haut" else "haut"):
-            for t in pas_de(0.0, 0.5, 0.1):
-                q = (p[0] + (centre[0] - p[0]) * t, p[1] + (centre[1] - p[1]) * t)
-                x, y = self.ecran(v, *q)
-                if self.libre(zones, x, y):
-                    return v, (int(round(x)), int(round(y))), q
-        return None
-
-    def emplacements_sorts(self, zones, base=None):
-        """Par sort, la liste ordonnée des (vue, point), DANS la base adverse : milieu de
-        chaque côté (haut-gauche, bas-droite, haut-droite, bas-gauche), puis les coins, à
-        PRECIPITATION_DEDANS ou RAGE_DEDANS cases à l'intérieur de son bord. Les côtés du
-        haut et les coins gauche/droite se lancent dans la vue haut, les autres dans la vue
-        bas : chaque sort part juste après les troupes qui vont dans sa direction."""
-        ia, ib, ja, jb = self.bords_base(base or self.base_par_defaut())
-        centre = ((ia + ib) / 2, (ja + jb) / 2)
-        im, jm = centre
-        sorties = {}
-        for sort, d in (("precipitation", PRECIPITATION_DEDANS), ("rage", RAGE_DEDANS)):
-            d = min(d, (ib - ia) / 3, (jb - ja) / 3)        # petite base : on reste dedans
-            dc = 0.75 * d                                   # aux coins, on rentre en diagonale
-            cibles = {"gh": (im, ja + d), "dh": (ia + d, jm), "gb": (ib - d, jm), "db": (im, jb - d),
-                      "h": (ia + dc, ja + dc), "d": (ia + dc, jb - dc),
-                      "g": (ib - dc, ja + dc), "b": (ib - dc, jb - dc)}
-            places = [self.place_dans_base(cibles[n], "bas" if n in ("gb", "db", "b") else "haut", zones, centre)
-                      for n in ORDRE_SORTS]
-            sorties[sort] = [(v, p) for v, p, _ in (pl for pl in places if pl)]
-            self.cibles_sorts[sort] = [(v, q, centre) for v, _, q in (pl for pl in places if pl)]
-        return sorties
-
-    def recaler_sorts(self, emplacements, zones, vue="bas"):
-        """La vue a bougé (décalage remesuré) : recalcule les points d'écran des sorts de
-        cette vue, sur les mêmes cases, sans changer quel sort part dans quelle vue."""
-        for sort, liste in emplacements.items():
-            cibles = self.cibles_sorts.get(sort, [])
-            for k, (v, _) in enumerate(liste):
-                if v == vue and k < len(cibles):
-                    _, q, centre = cibles[k]
-                    place = self.place_dans_base(q, vue, zones, centre, vues=(vue,))
-                    if place:
-                        liste[k] = (vue, place[1])
-
-    def contour_base(self, base, vue):
-        """Les 4 coins de la base à l'écran, pour les images de debug."""
-        ia, ib, ja, jb = self.bords_base(base)
-        return [tuple(int(v) for v in self.ecran(vue, i, j)) for i, j in ((ia, ja), (ia, jb), (ib, jb), (ib, ja))]
-
     def sondes(self, cle, position=20):
         """Cases à essayer pour trouver un bord : à « position » le long de ce bord (le milieu
         d'abord), de l'extérieur de la carte vers l'intérieur."""
@@ -1937,105 +1952,6 @@ class Plan:
             if trouves[a0] or trouves[a1]:
                 trouves[a0] = trouves[a1] = True
         return all(trouves.values())
-
-
-# ─── La base adverse (où lancer les sorts) ───────────────────────────────────
-#
-# Sur une vue, chaque case de la carte reçoit son « relief » : la force des contours de
-# couleur autour de son centre. Bâtiments et murs en ont beaucoup ; le sol nu (herbe, terre,
-# sable, selon le décor) peu. Le seuil se règle sur la bande de pose, au bord de la carte, où
-# il n'y a jamais rien. La base est le rectangle de cases (en i, j) qu'on fait grandir depuis
-# le centre des cases chargées, côté par côté, tant qu'au moins un quart des cases de la rangée
-# suivante est occupé (un trou de 2 rangées, une cour entre deux murs, ne l'arrête pas).
-
-BANDE_POSE = 3               # cases de la bande de pose, hors de la carte : jamais de bâtiment
-
-
-def releve_cases(ecran, plan, vue, zones, k=2):
-    """Relief moyen autour du centre de chaque case (tableau N × M) ; NaN si la case est
-    cachée (hors de l'écran, sous la barre, les boutons ou les affichages)."""
-    img = ecran.img
-    h, w = img.shape[:2]
-    a, b = plan.d["case"]
-    ra, rb = max(2, int(0.55 * a * plan.kx / k)), max(2, int(0.55 * b * plan.ky / k))
-    moyenne = cv2.blur(_texture(img, k), (2 * ra + 1, 2 * rb + 1))
-    x, y = plan.ecran_grille(vue)
-    visible = (x > 0.01 * w) & (x < 0.99 * w) & (y > 0) & (y < h)
-    for x0, y0, x1, y1 in zones:
-        visible &= ~((x >= x0) & (x <= x1) & (y >= y0) & (y <= y1))
-    T = np.full(x.shape, np.nan, np.float32)
-    xi = np.clip((x / k).astype(int), 0, moyenne.shape[1] - 1)
-    yi = np.clip((y / k).astype(int), 0, moyenne.shape[0] - 1)
-    T[visible] = moyenne[yi[visible], xi[visible]]
-    return T
-
-
-def seuil_sol(T):
-    """Relief au-delà duquel une case porte quelque chose : réglé sur la bande de pose."""
-    N, M = T.shape
-    a, z = 1, BANDE_POSE
-    bande = np.r_[T[a:z, z:M - z].ravel(), T[N - z:N - a, z:M - z].ravel(),
-                  T[z:N - z, a:z].ravel(), T[z:N - z, M - z:M - a].ravel()]
-    bande = bande[~np.isnan(bande)]
-    if len(bande) < 15:
-        return None
-    return max(7.0, float(np.percentile(bande, 75)) + 3.5)
-
-
-def base_adverse(plan, ecrans, zones, tau=0.25, vide=3):
-    """Rectangle de la base : dict n0, n1, m0, m1 (cases de la grille de plan.ecran_grille),
-    trouvee=True. ecrans = {"haut": Ecran, "bas": Ecran}, pris avant toute pose (les troupes
-    qui marchent compteraient comme des bâtiments). Base par défaut si rien de net."""
-    occupe, vu = None, None
-    for vue, ecran in ecrans.items():
-        if ecran is None:
-            continue
-        T = releve_cases(ecran, plan, vue, zones)
-        s = seuil_sol(T)
-        if s is None:
-            continue
-        v = ~np.isnan(T)
-        o = v & (np.nan_to_num(T) > s)
-        if occupe is None:
-            occupe, vu = o, v
-        else:                                   # chaque case : la première vue qui la montre
-            occupe, vu = np.where(vu, occupe, o), vu | v
-    if occupe is None:
-        return plan.base_par_defaut()
-    N, M = occupe.shape
-    lo_n, hi_n, lo_m, hi_m = BANDE_POSE, N - 1 - BANDE_POSE, BANDE_POSE, M - 1 - BANDE_POSE
-    ns, ms = np.nonzero(occupe)
-    garde = (ns >= 0.25 * N) & (ns <= 0.75 * N) & (ms >= 0.25 * M) & (ms <= 0.75 * M)
-    if garde.sum() < 20:
-        return plan.base_par_defaut()
-    nc, mc = int(np.median(ns[garde])), int(np.median(ms[garde]))
-    R = {"n0": nc - 2, "n1": nc + 2, "m0": mc - 2, "m1": mc + 2}
-
-    def rangee(cote, decal):
-        """Part des cases visibles occupées dans la rangée juste derrière ce côté (None si
-        elle sort de la carte ou si l'on n'en voit presque rien)."""
-        if cote[0] == "n":
-            n = R["n0"] - 1 - decal if cote == "n0" else R["n1"] + 1 + decal
-            if not lo_n <= n <= hi_n:
-                return None
-            o, v = occupe[n, R["m0"]:R["m1"] + 1], vu[n, R["m0"]:R["m1"] + 1]
-        else:
-            m = R["m0"] - 1 - decal if cote == "m0" else R["m1"] + 1 + decal
-            if not lo_m <= m <= hi_m:
-                return None
-            o, v = occupe[R["n0"]:R["n1"] + 1, m], vu[R["n0"]:R["n1"] + 1, m]
-        return float(o[v].mean()) if v.sum() >= 3 else None
-
-    actifs = set(R)
-    while actifs:
-        for cote in sorted(actifs):
-            if rangee(cote, 0) is None or all(p is None or p < tau for p in (rangee(cote, d) for d in range(vide))):
-                actifs.discard(cote)
-            else:
-                R[cote] += -1 if cote.endswith("0") else 1
-    if R["n1"] - R["n0"] < 10 or R["m1"] - R["m0"] < 10:
-        return plan.base_par_defaut()
-    return {**R, "trouvee": True}
 
 
 def vignette(tel):
@@ -2077,7 +1993,7 @@ def _pincements(tel, n):
     for k in range(n):
         ok = tel.pincer() and ok
         if k < n - 1:
-            time.sleep(0.15)
+            time.sleep(0.05)
     attendre_arret(tel, 0.45)
     return ok
 
@@ -2184,6 +2100,43 @@ class FinDuCombat(Exception):
     """Le bouton rouge a disparu : on ne touche plus rien."""
 
 
+def foyers_troupes(tel, plan, vue, zones, n, evites=()):
+    """(dernier écran, jusqu'à n points d'écran) où bougent le plus de troupes, du groupe le
+    plus chargé au moins chargé, espacés d'au moins un rayon et demi de sort. Trois images à
+    0,12 s d'écart, comparées en quart de résolution (~3 ms de calcul) : les troupes qui
+    marchent et se battent changent l'image, les bâtiments non. Seulement sur la carte, hors
+    affichages du jeu et hors des endroits `evites` (sorts déjà lancés, qui scintillent)."""
+    k = 2 / REDUCTION                                   # pixels d'écran par pixel du quart d'image
+    images, ecran = [], None
+    for i in range(3):
+        if i:
+            time.sleep(0.12)
+        ecran = tel.capture()
+        images.append(cv2.resize(ecran.gris, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA).astype(np.int16))
+    bouge = ((np.abs(images[1] - images[0]) > 12) | (np.abs(images[2] - images[1]) > 12)).astype(np.float32)
+    h, w = bouge.shape
+    masque = np.zeros((h, w), np.float32)
+    b = plan.d["bords"]
+    coins = [plan.ecran(vue, i, j) for i, j in ((b["i0"], b["j0"]), (b["i0"], b["j1"]), (b["i1"], b["j1"]), (b["i1"], b["j0"]))]
+    cv2.fillPoly(masque, [np.array([(x / k, y / k) for x, y in coins], np.int32)], 1.0)
+    for x0, y0, x1, y1 in zones:
+        masque[max(0, int(y0 / k)):max(0, int(y1 / k) + 1), max(0, int(x0 / k)):max(0, int(x1 / k) + 1)] = 0
+    a, bb = plan.d["case"]
+    rx = max(2, int(SORT_RAYON * a * 1.41 * plan.kx / k))
+    ry = max(2, int(SORT_RAYON * bb * 1.41 * plan.ky / k))
+    densite = cv2.boxFilter(bouge * masque, -1, (2 * rx + 1, 2 * ry + 1)) * masque
+    for x, y in evites:
+        cv2.ellipse(densite, (int(x / k), int(y / k)), (rx, ry), 0, 0, 360, 0, -1)
+    foyers = []
+    while len(foyers) < n:
+        _, v, _, (x, y) = cv2.minMaxLoc(densite)
+        if v < SORT_DENSITE_MIN:
+            break
+        foyers.append((int(x * k), int(y * k)))
+        cv2.ellipse(densite, (x, y), (int(1.5 * rx), int(1.5 * ry)), 0, 0, 360, 0, -1)
+    return ecran, foyers
+
+
 def rafale(tel, touches, boite):
     """Envoie les touches par paquets de RAFALE. Entre deux paquets, vérifie que le combat
     continue en ne capturant que les lignes du bouton rouge."""
@@ -2206,19 +2159,21 @@ def reste(ecran, carte):
 
 
 class Deploiement:
-    """Dézoom, vue haut (sorts, moitié des troupes, une partie des héros sur les deux bords
-    du haut), vue bas (le reste sur les deux bords du bas), vérifications, compétences."""
+    """Dézoom, vue haut (moitié des troupes, une partie des héros sur les deux bords du haut),
+    vue bas (le reste sur les deux bords du bas), vérifications, compétences, puis les sorts
+    sur les groupes de troupes."""
 
     def __init__(self, tel, cartes, zones, boite, plan, debug=False, numero=0):
         self.tel, self.cartes, self.zones, self.boite, self.plan = tel, cartes, zones, boite, plan
         self.debug, self.numero = debug, numero
         hauteur = cartes[0].y1 - cartes[0].y0
         self.haut = min(min(c.y0 for c in cartes) - int(0.32 * hauteur), boite[1]) - 4
-        self.sorts = [c for c in cartes if c.sort and c.nombre]
+        self.sorts = [c for c in cartes if c.sort]
         self.troupes = [c for c in cartes if c.nombre and not c.sort]
-        self.uniques = [c for c in cartes if c.nombre is None]
+        self.uniques = [c for c in cartes if c.nombre is None and not c.sort]
         self.mauvais = set()
-        self.emplacements = {}
+        self.poses = {}              # vue -> points où les troupes ont été posées
+        self.fin_pose = time.monotonic()
         for c in cartes:
             c.points = []
 
@@ -2296,30 +2251,27 @@ class Deploiement:
         c.points += points
         return [c.point] + points if points else []
 
-    def poser_vue(self, vue, ecran, emplacements):
-        """Pose dans la vue courante : sorts prévus ici, puis troupes, puis héros/engin."""
+    def poser_vue(self, vue, ecran):
+        """Pose dans la vue courante : troupes, puis héros/engin (les sorts viennent après)."""
         chemin = self.plan.chemin(vue, self.zones)
         if not chemin:
             raise Bloque(f"aucun point de pose dans la vue {vue} : vérifie avec « python bot_coc.py vues »", ecran)
-        sorts = []
-        for c in self.sorts:                            # chaque sort sur ses emplacements de cette vue
-            places = (emplacements.get(c.sort) or emplacements["precipitation"])[:c.nombre]
-            sorts += self.touches(c, [p for v, p in places if v == vue])
-        troupes = []
+        touches = []
         for q, c in enumerate(self.troupes):
             if vue == "haut":
                 k = (c.nombre - len(c.points) + 1) // 2           # la moitié (moins les sondes)
             else:                                               # tout ce qui reste
                 n = 0 if carte_epuisee(ecran, c) else lire_compteur(ecran, c)
                 k = n if n is not None else max(0, c.nombre - len(c.points))
-            troupes += self.touches(c, repartir(chemin, k, 0.5 * q / max(1, len(self.troupes))))
+            touches += self.touches(c, repartir(chemin, k, 0.5 * q / max(1, len(self.troupes))))
         moitie = (len(self.uniques) + 1) // 2
         uniques = self.uniques[:moitie] if vue == "haut" else self.uniques[moitie:]
         for q, c in enumerate(uniques):
-            troupes += self.touches(c, repartir(chemin, 1, (q + 0.5) / max(1, len(uniques)) - 0.5))
-        touches = sorts + troupes if SORTS_AVANT_TROUPES else troupes + sorts
+            touches += self.touches(c, repartir(chemin, 1, (q + 0.5) / max(1, len(uniques)) - 0.5))
         log(f"  vue {vue} : {len(touches)} touches")
         rafale(self.tel, touches, self.boite)
+        self.poses[vue] = [p for p in touches if p not in {c.point for c in self.cartes}]
+        self.fin_pose = time.monotonic()
         return chemin
 
     def completer(self, chemin):
@@ -2345,70 +2297,115 @@ class Deploiement:
                     self.mauvais.update(c.points[-1:])
                     libres = [p for p in chemin_p if p not in self.mauvais]
                     pts = repartir(libres or chemin_p, 1, 0.13 * passe + 0.29 * q)
-                elif c.sort:                            # dans la base, jamais sur le bord
-                    places = [p for v, p in (self.emplacements.get(c.sort) or
-                                             self.emplacements.get("precipitation", [])) if v == "bas"]
-                    pts = [places[q % len(places)] for q in range(k)] if places else []
                 else:
                     pts = repartir(chemin_p, k + EXTRA, 0.17 * passe + 0.07 * q)
                 touches += self.touches(c, pts)
             rafale(self.tel, touches, self.boite)
 
     def mesurer_vue_bas(self, ecran_haut, ecran_bas):
+        """Mesure la vue bas ; si elle échoue (caméra pas tout à fait arrêtée ?), une seconde
+        fois 0,2 s plus tard. Renvoie l'écran utilisé."""
         mesure = mesurer_decalage(ecran_haut, ecran_bas, self.plan, self.zones)
+        if mesure is None:
+            time.sleep(0.2)
+            ecran_bas = self.tel.capture()
+            mesure = mesurer_decalage(ecran_haut, ecran_bas, self.plan, self.zones)
         if mesure is None:
             log(f"  vue bas non mesurée : je garde le décalage "
                 f"{self.plan.decalage[0]:+.0f}, {self.plan.decalage[1]:+.0f} px")
         else:
             self.plan.noter_decalage(mesure)
+        return ecran_bas
 
     def lancer(self):
         w, h = self.plan.w, self.plan.h
         if not dezoomer(self.tel):
             log("  je ne peux pas dézoomer moi-même : dézoome à fond à la main une fois (le jeu garde le zoom)")
-        sorts = bool(self.sorts)
-        if sorts:                                       # le bas du village, intact, pour repérer la base
-            aller_vue(self.tel, "bas", w, h)
-            ecran_bas0 = self.tel.capture()
         aller_vue(self.tel, "haut", w, h)
         ecran_haut = self.tel.capture()
-        if sorts:
-            self.mesurer_vue_bas(ecran_haut, ecran_bas0)
         self.sonder("haut")
-        base = base_adverse(self.plan, {"haut": ecran_haut, "bas": ecran_bas0}, self.zones) if sorts else None
-        emplacements = self.plan.emplacements_sorts(self.zones, base)
-        self.emplacements = emplacements
-        if base is not None:
-            n, m = base["n1"] - base["n0"] + 1, base["m1"] - base["m0"] + 1
-            log(f"  base adverse : {n}×{m} cases" if base["trouvee"] else
-                "  base adverse pas nette : sorts au milieu de la carte")
         log("  armée : " + ", ".join(c.decrire() for c in self.cartes))
-        chemin = self.poser_vue("haut", ecran_haut, emplacements)
+        chemin = self.poser_vue("haut", ecran_haut)
         if self.debug:
-            sauver(annoter(ecran_haut, self.cartes, self.zones, chemin, emplacements=emplacements, vue="haut",
-                           contour=self.plan.contour_base(base, "haut") if base else None),
-                   f"combat_{self.numero}_haut")
+            sauver(annoter(ecran_haut, self.cartes, self.zones, chemin), f"combat_{self.numero}_haut")
 
         aller_vue(self.tel, "bas", w, h)
         ecran_bas = self.tel.capture()
         if not en_combat(ecran_bas, self.boite):
             raise FinDuCombat
-        avant = list(self.plan.decalage)
-        self.mesurer_vue_bas(ecran_haut, ecran_bas)     # la vue bas peut avoir un peu glissé
-        if sorts and max(abs(a - b) for a, b in zip(avant, self.plan.decalage)) > 4:
-            self.plan.recaler_sorts(emplacements, self.zones)
+        ecran_bas = self.mesurer_vue_bas(ecran_haut, ecran_bas)
         self.sonder("bas")
-        chemin = self.poser_vue("bas", ecran_bas, emplacements)
+        chemin = self.poser_vue("bas", ecran_bas)
         if self.debug:
-            sauver(annoter(ecran_bas, self.cartes, self.zones, chemin, emplacements=emplacements, vue="bas",
-                           contour=self.plan.contour_base(base, "bas") if base else None),
-                   f"combat_{self.numero}_bas")
+            sauver(annoter(ecran_bas, self.cartes, self.zones, chemin), f"combat_{self.numero}_bas")
 
         self.completer(chemin)
         heros = [c for c in self.uniques if c.heros]
         if heros:
             self.tel.toucher(*[c.point for c in heros])
             log(f"  → compétences des {len(heros)} héros")
+        self.lancer_sorts()
+
+    def points_secours(self, vue, m):
+        """Moins de groupes de troupes visibles que de sorts : m autres points, différents,
+        entre les endroits où les troupes ont été posées dans cette vue et le centre de la
+        carte (là où elles vont)."""
+        cx, cy = self.plan.ecran(vue, *self.plan.centre())
+        points = []
+        for px, py in repartir(self.poses.get(vue) or [(cx, cy)], m):
+            for t in (0.4, 0.7, 0.0):
+                x, y = px + (cx - px) * t, py + (cy - py) * t
+                if self.plan.libre(self.zones, x, y):
+                    points.append((int(x), int(y)))
+                    break
+        return points
+
+    def lancer_sorts(self):
+        """Sorts une fois toutes les troupes posées, sur les groupes de troupes les plus
+        nombreux (foyers_troupes) : la moitié dans la vue bas (on y est), le reste dans la vue
+        haut. Le combat tourne pendant ce temps : l'attaque n'en dure pas plus longtemps."""
+        attente = self.fin_pose + SORTS_APRES - time.monotonic()
+        if self.sorts and attente > 0:                  # que les troupes arrivent au contact
+            time.sleep(attente)
+        if any(c.nombre is None for c in self.sorts):   # compteur illisible au début : relu
+            ecran = self.capture_barre()
+            for c in self.sorts:
+                if c.nombre is None:
+                    c.nombre = lire_compteur(ecran, c) or 1
+        sorts = [c for c in self.sorts if c.nombre]
+        if not sorts:
+            return
+        lances = []                                     # points de la vue bas, déjà couverts
+        for vue in ("bas", "haut"):
+            parts = {id(c): c.nombre // 2 if vue == "bas" else c.nombre - c.nombre // 2 for c in sorts}
+            n = max(parts.values())
+            if not n:
+                continue
+            if vue == "haut":
+                aller_vue(self.tel, "haut", self.plan.w, self.plan.h)
+            dx, dy = self.plan.decalage[0] * self.plan.kx, self.plan.decalage[1] * self.plan.ky
+            evites = [(x - dx, y - dy) for x, y in lances] if vue == "haut" else []
+            ecran, foyers = foyers_troupes(self.tel, self.plan, vue, self.zones, n, evites)
+            if not en_combat(ecran, self.boite):
+                raise FinDuCombat
+            vus = len(foyers)
+            if vus < n:
+                foyers += self.points_secours(vue, n - vus)
+            if not foyers:
+                continue
+            touches, places = [], {}
+            for c in sorts:
+                pts = [foyers[q % len(foyers)] for q in range(parts[id(c)])]
+                touches += self.touches(c, pts)
+                places.setdefault(c.sort, []).extend((vue, p) for p in pts)
+            rafale(self.tel, touches, self.boite)
+            log(f"  vue {vue} : sorts sur {vus} groupe(s) de troupes" if vus else
+                f"  vue {vue} : pas de troupes visibles, sorts entre les poses et le centre")
+            if vue == "bas":
+                lances = [p for _, liste in places.items() for _, p in liste]
+            if self.debug:
+                sauver(annoter(ecran, self.cartes, self.zones, [], emplacements=places, vue=vue),
+                       f"combat_{self.numero}_sorts_{vue}")
 
 
 def deployer(tel, cartes, zones, boite, plan, debug=False, numero=0):
@@ -2459,26 +2456,36 @@ def bouton_vert(ecran, zone=(0.20, 0.30, 0.80, 0.94)):
     return None if choix is None else (int(xa + choix[0] + choix[2] / 2), int(ya + choix[1] + choix[3] / 2))
 
 
-def abandonner(tel, boite=None):
+def abandonner(tel, boite=None, raison="durée atteinte"):
     """Appuie sur « Capituler » / « Terminer la bataille » puis confirme (templates/
-    confirmer.png s'il existe, sinon le bouton vert de la fenêtre)."""
-    b = bouton_rouge(tel.capture()) or boite
+    confirmer.png s'il existe, sinon le bouton vert de la fenêtre). La fenêtre est guettée en
+    continu (elle s'ouvre en ~0,3 s) ; son bouton n'est touché que s'il vient d'apparaître (pas
+    un bout d'herbe vert vif déjà là avant) et qu'il est immobile (vu deux fois au même endroit)."""
+    ecran = tel.capture()
+    b = bouton_rouge(ecran) or boite
     if b is None:
-        log("  durée atteinte, mais je ne vois pas le bouton Capituler / Terminer la bataille")
+        log(f"  {raison}, mais je ne vois pas le bouton Capituler / Terminer la bataille")
         return False
+    deja = bouton_vert(ecran)
     x, y, bw, bh = b
-    log("  → durée atteinte : capituler / terminer la bataille")
+    log(f"  → {raison} : capituler / terminer la bataille")
     tel.toucher((x + bw // 2, y + bh // 2))
-    time.sleep(0.9)
-    for _ in range(4):
+    rapide = getattr(tel, "video", lambda: None)() is not None
+    fin = time.monotonic() + (2.5 if rapide else 4.0)
+    time.sleep(0.15 if rapide else 0.9)
+    avant = None
+    while time.monotonic() < fin:
         ecran = tel.capture()
         t = localiser(ecran, "confirmer")
         p = (t.x, t.y) if t else bouton_vert(ecran)
-        if p:
+        if p and deja and abs(p[0] - deja[0]) <= 12 and abs(p[1] - deja[1]) <= 12:
+            p = None                                    # déjà là avant : pas la fenêtre
+        if p and avant and abs(p[0] - avant[0]) <= 12 and abs(p[1] - avant[1]) <= 12:
             tel.toucher(p)
             log("  → confirmer")
             return True
-        time.sleep(0.4)
+        avant = p
+        time.sleep(0.1 if rapide else 0.4)
     log("  pas de fenêtre de confirmation (fin directe ?)")
     return True
 
@@ -2590,20 +2597,30 @@ def choisir_village(tel, ecran):
 
 
 def attendre_fin(tel, boite, delai=300, duree=None, debut=None):
-    """Attend l'écran de fin et renvoie le bouton « Rentrer ». Pendant le combat, on ne
-    capture que les lignes du bouton rouge (rapide et économe) ; dès qu'il disparaît, on
-    cherche « Rentrer », là où il était la dernière fois si on le sait. Avec --duree, on
-    capitule (ou termine la bataille) quand le temps est écoulé."""
+    """Attend l'écran de fin et renvoie le bouton « Rentrer ». Pendant le combat, on surveille
+    le bouton rouge et les « Dégâts généraux » : on capitule quand le temps --duree est écoulé,
+    ou quand les dégâts n'ont pas bougé depuis CAPITULER_SI_FIGE s (troupes mortes ou bloquées).
+    Dès que le bouton rouge disparaît, on cherche « Rentrer », touché une fois immobile."""
     fin = time.monotonic() + delai
     ecran, essais, abandon = None, 0, False
     vitesse = Vitesse(tel)
+    degats, change, vu = None, time.monotonic(), None
     while time.monotonic() < fin:
         ecran = tel.capture_bande(*bande_rouge(boite))
+        maintenant = time.monotonic()
         if en_combat(ecran, boite):
-            if duree and debut and not abandon and time.monotonic() - debut >= duree:
-                abandon = True
-                abandonner(tel, boite)
-                continue
+            if debut and not abandon:
+                d = lire_degats(ecran)
+                if d is not None and d != degats:
+                    degats, change = d, maintenant
+                fige = (CAPITULER_SI_FIGE and d is not None and d == degats
+                        and maintenant - change >= CAPITULER_SI_FIGE
+                        and maintenant - debut >= CAPITULER_APRES_MIN)
+                if fige or (duree and maintenant - debut >= duree):
+                    abandon = True
+                    abandonner(tel, boite, f"dégâts figés à {degats} % depuis {maintenant - change:.0f} s"
+                               if fige else "durée atteinte")
+                    continue
             if not abandon:
                 vitesse.guetter(debut)
             time.sleep(0.4)
@@ -2614,7 +2631,12 @@ def attendre_fin(tel, boite, delai=300, duree=None, debut=None):
         essais += 1
         t = localiser(ecran, "rentrer_village")
         if t:
-            return t
+            if vu and abs(vu[0] - t.x) <= 12 and abs(vu[1] - t.y) <= 12:
+                return t                             # immobile : la fenêtre a fini de s'ouvrir
+            vu = (t.x, t.y)
+            time.sleep(0.1)
+            continue
+        vu = None
         if complet:
             if localiser(ecran, "combat"):
                 return None                          # déjà revenu au village
@@ -2631,8 +2653,12 @@ def une_attaque(tel, numero, debug=False, duree=None):
     log(f"Attaque n°{numero}")
 
     # 1. Lancement : « Combat », « Trouver une partie », « Attaquer »… jusqu'au combat
+    # « Rentrer » de l'écran de recherche : il est aussi affiché pendant toute recherche normale
+    # (quelques secondes) ; on ne le touche que si l'écran reste figé (« Impossible d'attaquer
+    # ce village »)
     ecran, rouge = attendre(tel, ["terminer_bataille"], 120,
-                            en_route=["trouver_partie", "attaquer", "combat"])
+                            en_route=["trouver_partie", "attaquer", "combat"],
+                            patients={"recherche_rentrer": 25.0})
     boite = rouge.boite
     if ecran.partielle:
         ecran = tel.capture()                     # l'écran entier pour le butin et la barre
@@ -2642,14 +2668,22 @@ def une_attaque(tel, numero, debug=False, duree=None):
 
     # 3. La barre : cartes, compteurs, sorts. Sans aucune carte de troupes, c'est louche
     #    (barre pas encore affichée ?) : on regarde à nouveau, deux fois au plus.
-    for essai in range(3):
+    #    Même lecture sur deux images de suite : la barre peut encore être en train d'apparaître
+    #    (une carte de sort lue sans son compteur passerait sinon pour une unité).
+    avant = None
+    for essai in range(4):
         cartes = detecter_cartes(ecran)
         analyser_cartes(ecran, cartes)
-        if any(c.nombre and not c.sort for c in cartes) or essai == 2:
+        lecture = [c.decrire() for c in cartes]
+        complete = any(c.nombre and not c.sort for c in cartes) and \
+            not any(c.sort and c.nombre is None for c in cartes)
+        if (complete and lecture == avant) or essai == 3:
             break
-        log("  aucune carte de troupes vue dans la barre : je regarde à nouveau")
-        time.sleep(0.5)
+        avant = lecture
+        time.sleep(0.15)
         ecran = tel.capture()
+    if not any(c.nombre and not c.sort for c in cartes):
+        log("  aucune carte de troupes lisible dans la barre")
     apprendre_cartes(ecran, cartes)
     log(f"  barre : {len(cartes)} cartes, dont {sum(1 for c in cartes if c.connue)} reconnues par leur dessin")
     zones = zones_interdites(ecran, cartes, boite, suivant.boite if suivant else None)
@@ -3469,14 +3503,11 @@ def sauver(img, nom, horodatage=True):
     return chemin
 
 
-def annoter(ecran, cartes, zones, chemin, trouves=(), emplacements=None, vue=None, contour=None):
+def annoter(ecran, cartes, zones, chemin, trouves=(), emplacements=None, vue=None):
     """Rouge = zones interdites, jaune = boutons, bleu = cartes, vert = rangée du bord où
-    les troupes sont posées, magenta = contour de la base adverse, rose = précipitation,
-    violet = rage (ceux de cette vue)."""
+    les troupes sont posées, rose = précipitation, violet = rage (ceux de cette vue)."""
     img = ecran.img.copy()
     ep = max(2, ecran.w // 800)
-    if contour:
-        cv2.polylines(img, [np.array(contour, np.int32)], True, (255, 0, 255), ep + 1)
     for x0, y0, x1, y1 in zones:
         cv2.rectangle(img, (int(x0), int(y0)), (int(x1), int(y1)), (0, 0, 255), ep)
     for t in trouves:
@@ -3603,17 +3634,10 @@ def mode_vues(tel, vue_image=None):
             print(f"Décalage entre les vues : {mesure[0]:+.0f}, {mesure[1]:+.0f} px "
                   f"(attendu {attendu[0]:+.0f}, {attendu[1]:+.0f})")
             plan.decalage = list(mesure)
-    base = base_adverse(plan, captures, zones)
-    print(f"Base adverse : {base['n1'] - base['n0'] + 1}×{base['m1'] - base['m0'] + 1} cases"
-          if base["trouvee"] else "Base adverse pas nette : base par défaut (milieu de la carte)")
-    emplacements = plan.emplacements_sorts(zones, base)
     for vue, e in captures.items():
         chemin = plan.chemin(vue, zones)
-        nb = {nom: sum(1 for v, _ in p if v == vue) for nom, p in emplacements.items()}
-        image = annoter(e, cartes, zones, chemin, emplacements=emplacements, vue=vue,
-                        contour=plan.contour_base(base, vue))
-        print(f"Vue {vue} : {len(chemin)} points de pose, " + ", ".join(f"{n} {k}" for k, n in nb.items())
-              + f"  → {sauver(image, f'vue_{vue}', False)}")
+        image = annoter(e, cartes, zones, chemin)
+        print(f"Vue {vue} : {len(chemin)} points de pose  → {sauver(image, f'vue_{vue}', False)}")
 
 
 def mode_test_nuit(tel):
