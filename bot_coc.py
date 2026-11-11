@@ -75,6 +75,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -132,7 +133,7 @@ SORTS = TEMPLATES / "sorts"
 CARTES = TEMPLATES / "cartes"     # dessin de chaque carte de ton armée (appris tout seul)
 DEBUG = DOSSIER / "debug"
 
-ADB_SERIAL = None            # None = l'unique téléphone branché ; sinon son numéro, ex. "R5CXXXXXXXX" (adb devices)
+ADB_SERIAL = None            # None : le câble s'il est branché, sinon le téléphone connecté en Wi-Fi (adb connect) ; ou son numéro (adb devices)
 GARDER_ECRAN_ALLUME = True   # écran du téléphone toujours allumé pendant le bot (rétabli à la fin)
 SEUIL = 0.80                 # confiance minimale pour reconnaître un bouton (0 à 1)
 SEUIL_POPUP = 0.92           # popups/*.png : touchés dès qu'ils sont vus, donc plus exigeant
@@ -140,10 +141,13 @@ SEUIL_POPUP = 0.92           # popups/*.png : touchés dès qu'ils sont vus, don
 REDUCTION = 0.5              # la recherche se fait en demi-résolution : 4× moins de calcul
 ECHELLES = (1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2, 0.75, 1.25, 0.7, 1.3)
 
-# Choix du village : il attaque si or + élixir + POIDS_NOIR × élixir noir ≥ BUTIN_MIN_TOTAL.
+# Choix du village : il attaque si or + élixir + POIDS_NOIR × élixir noir ≥ BUTIN_MIN_TOTAL,
+# ou, avec --or / --elixir / --noir, si chaque ressource choisie atteint son minimum.
 # Sinon il appuie sur « Suivant » (qui coûte de l'or). Modifiable au lancement : --butin 3M
 BUTIN_MIN_TOTAL = 2_200_000
 POIDS_NOIR = 120             # 1 élixir noir compte comme 120 or ou élixir
+BUTIN_MIN = {}               # par ressource, ex. {"or_": 1_000_000, "noir": 8_000}
+RESSOURCES = {"or_": "or", "elixir": "élixir", "noir": "noir"}
 SUIVANTS_MAX = 30            # au-delà de 30 villages passés d'affilée, il attaque quand même
 
 # Doigts simulés par le serveur de scrcpy (gestes à deux doigts sans root, touches rapides).
@@ -163,6 +167,7 @@ PINCEMENT_DUREE = 0.14       # s par pincement (4 × 0,28 s avant : 2,0 s de dé
 VIDEO_SCRCPY = True
 VIDEO_IPS = 10               # images par seconde (20 : 8 % d'un cœur au lieu de 5 %, pour 25 ms de gagnées)
 VIDEO_DEBIT = 8_000_000      # bits/s : assez pour que les images valent une capture d'écran
+VIDEO_DEBIT_SANS_FIL = 4_000_000   # en Wi-Fi : moitié moins (radio du téléphone), encore large à 1170×540
 
 # Résolution du jeu. Tout le bot (boutons, chiffres, cartes, bords de la carte) est réglé sur le
 # jeu affiché en 50 % : en 100 %, le jeu dessine les boutons et les textes autrement (plus nets,
@@ -212,6 +217,10 @@ VITESSE_APRES = 100.0        # s de combat avant de commencer à le guetter
 # capitule sans attendre la fin du combat ni --duree. None : jamais.
 CAPITULER_SI_FIGE = 6.0
 CAPITULER_APRES_MIN = 20.0
+# Bonus de victoire : à SEUIL_ETOILE % ou plus sans aucune étoile, on laisse plus de temps
+# (délai sans destruction doublé, durée max + BONUS_ETOILE s) tant que l'étoile n'est pas là.
+SEUIL_ETOILE = 46
+BONUS_ETOILE = 15.0
 VITESSE_PERIODE = 3.0        # s entre deux coups d'œil tant qu'il n'est pas sur 4x
 
 # Base des ouvriers (--nuit)
@@ -285,28 +294,70 @@ class Butin:
         return self.or_ + self.elixir + POIDS_NOIR * self.noir
 
     def suffisant(self):
-        return self.total >= BUTIN_MIN_TOTAL
+        return (self.total >= BUTIN_MIN_TOTAL
+                and all(getattr(self, r) >= m for r, m in BUTIN_MIN.items()))
 
     def __str__(self):
-        return (f"{self.or_:,} or · {self.elixir:,} élixir · {self.noir:,} noir "
-                f"= {self.total:,} au total").replace(",", " ")
+        texte = f"{self.or_:,} or · {self.elixir:,} élixir · {self.noir:,} noir"
+        if not BUTIN_MIN:
+            texte += f" = {self.total:,} au total"
+        return texte.replace(",", " ")
+
+
+def regle_butin():
+    if BUTIN_MIN:
+        texte = "attaque si " + " et ".join(f"{RESSOURCES[r]} ≥ {m:,}" for r, m in BUTIN_MIN.items())
+        if BUTIN_MIN_TOTAL:
+            texte += f" et or + élixir + {POIDS_NOIR} × noir ≥ {BUTIN_MIN_TOTAL:,}"
+    elif BUTIN_MIN_TOTAL:
+        texte = f"attaque si or + élixir + {POIDS_NOIR} × noir ≥ {BUTIN_MIN_TOTAL:,}"
+    else:
+        texte = "attaque le premier village trouvé (pas de butin minimum)"
+    return texte.replace(",", " ")
 
 
 class Ecran:
-    """Une capture ; sa version grise réduite n'est calculée que si on en a besoin."""
+    """Une capture. Celle de la vidéo arrive à la taille où le jeu dessine (la moitié de
+    l'écran) : l'image pleine taille n'est fabriquée qu'au premier accès à `img`, la version
+    grise réduite en sort directement, et `zone()` n'agrandit que le morceau demandé."""
 
-    def __init__(self, img, partielle=False):
-        self.img = img
-        self.h, self.w = img.shape[:2]
+    def __init__(self, img=None, partielle=False, petite=None, taille=None):
+        self._img = img
+        self._petite = petite
+        self.w, self.h = (img.shape[1], img.shape[0]) if img is not None else taille
         self.partielle = partielle     # True : seules quelques lignes ont été capturées
         self._gris = None
 
     @property
+    def img(self):
+        if self._img is None:
+            self._img = cv2.resize(self._petite, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+        return self._img
+
+    @property
     def gris(self):
         if self._gris is None:
-            g = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)
-            self._gris = cv2.resize(g, None, fx=REDUCTION, fy=REDUCTION, interpolation=cv2.INTER_AREA)
+            p = self._petite
+            if p is not None and p.shape[1] == round(self.w * REDUCTION) and p.shape[0] == round(self.h * REDUCTION):
+                self._gris = cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)
+            else:
+                g = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)
+                self._gris = cv2.resize(g, None, fx=REDUCTION, fy=REDUCTION, interpolation=cv2.INTER_AREA)
         return self._gris
+
+    def zone(self, x0, y0, x1, y1):
+        """Le morceau [y0:y1, x0:x1] de l'image pleine taille, sans l'agrandir en entier."""
+        x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(self.w, int(x1)), min(self.h, int(y1))
+        if self._img is not None or self._petite is None or x1 <= x0 or y1 <= y0:
+            return self.img[y0:y1, x0:x1]
+        kx, ky = self._petite.shape[1] / self.w, self._petite.shape[0] / self.h
+        a, b = max(0, int(x0 * kx) - 1), max(0, int(y0 * ky) - 1)
+        c = min(self._petite.shape[1], int(np.ceil(x1 * kx)) + 1)
+        d = min(self._petite.shape[0], int(np.ceil(y1 * ky)) + 1)
+        grand = cv2.resize(self._petite[b:d, a:c], (round((c - a) / kx), round((d - b) / ky)),
+                           interpolation=cv2.INTER_LINEAR)
+        ox, oy = x0 - round(a / kx), y0 - round(b / ky)
+        return grand[oy:oy + (y1 - y0), ox:ox + (x1 - x0)]
 
 
 class Bloque(Exception):
@@ -330,12 +381,13 @@ class CanalScrcpy:
     BAS, HAUT, BOUGE = 0, 1, 2                 # doigt posé, levé, déplacé (actions Android)
     DOIGT1, DOIGT2 = 0x0B070001, 0x0B070002
 
-    def __init__(self, adb, largeur, hauteur, video=False):
+    def __init__(self, adb, largeur, hauteur, video=False, debit=VIDEO_DEBIT):
         self.adb = list(adb)
         self.w, self.h = int(largeur), int(hauteur)
         self.proc = self.sock = self.port = None
         self.sortie = collections.deque(maxlen=30)
         self.video = video and av is not None
+        self.debit = debit
         self.sock_video = None
         self.vw = self.vh = 0                  # taille de la vidéo (les touches s'y rapportent)
         self.image = None                      # dernière image décodée (av.VideoFrame)
@@ -411,7 +463,7 @@ class CanalScrcpy:
         if self.video:
             cote = int(round(max(self.w, self.h) * (RESOLUTION_BOT or 1.0)))
             options = ["video=true", "video_codec=h264", f"max_size={cote}", f"max_fps={VIDEO_IPS}",
-                       f"video_bit_rate={VIDEO_DEBIT}"]
+                       f"video_bit_rate={self.debit}"]
         else:
             options = ["video=false"]
         self.proc = subprocess.Popen(
@@ -522,10 +574,7 @@ class CanalScrcpy:
             if not self.video_ok or self.image is None or self.t_image <= t:
                 return None                  # pas d'image neuve (écran éteint ?) : capture ADB
             image = self.image
-        img = image.to_ndarray(format="bgr24")
-        if img.shape[1] != self.w or img.shape[0] != self.h:
-            img = cv2.resize(img, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-        return img
+        return image.to_ndarray(format="bgr24")         # à la taille de la vidéo (Ecran agrandit au besoin)
 
     def doigt(self, action, ident, x, y):
         pression = 0 if action == self.HAUT else 0xFFFF
@@ -593,17 +642,59 @@ class CanalScrcpy:
 
 # ─── Téléphone (ADB) ─────────────────────────────────────────────────────────
 
+def est_sans_fil(serie):
+    return ":" in serie or "_adb-tls-connect" in serie
+
+
+def appareils():
+    """[(numéro, en Wi-Fi ?)] des téléphones prêts (état « device »)."""
+    try:
+        sortie = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=20).stdout
+    except subprocess.TimeoutExpired:
+        return []
+    champs = (ligne.split() for ligne in sortie.splitlines()[1:])
+    return [(c[0], est_sans_fil(c[0])) for c in champs if len(c) >= 2 and c[1] == "device"]
+
+
+def choisir_appareil():
+    """Le câble d'abord (plus rapide, et il recharge le téléphone), sinon le Wi-Fi."""
+    liste = sorted(appareils(), key=lambda a: a[1])
+    return liste[0] if liste else (None, False)
+
+
+def connecter_sans_fil():
+    """Lance adb-a54, s'il existe (ton script qui allume le débogage sans fil et fait adb connect) :
+    l'adresse ip:port, ou None."""
+    try:
+        r = subprocess.run(["adb-a54"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)", r.stdout)
+    if r.returncode != 0 or not m:
+        lignes = r.stdout.strip().splitlines()
+        log("  " + (lignes[-1] if lignes else "adb-a54 n'a rien répondu"))
+        return None
+    return m.group(1) if any(s == m.group(1) for s, _ in appareils()) else None
+
+
 class Telephone:
     def __init__(self, serial=ADB_SERIAL):
         if shutil.which("adb") is None:
             sys.exit("adb introuvable. Sur CachyOS : sudo pacman -S android-tools")
-        self.adb = ["adb"] + (["-s", serial] if serial else [])
-        etat = subprocess.run(self.adb + ["get-state"], capture_output=True, text=True)
-        if etat.stdout.strip() != "device":
-            sys.exit("Téléphone non détecté par ADB ("
-                     + (etat.stderr.strip() or etat.stdout.strip() or "aucune réponse") + ").\n"
-                     "Vérifie le câble et le débogage USB. Si plusieurs appareils sont "
-                     "branchés, mets le numéro du téléphone dans ADB_SERIAL en haut du script.")
+        self.connecte_par_moi = False
+        if serial is None:
+            serial, sans_fil = choisir_appareil()
+            if serial is None and shutil.which("adb-a54"):
+                log("Pas de câble : je connecte le téléphone en Wi-Fi (adb-a54)")
+                serial, sans_fil = connecter_sans_fil(), True
+                self.connecte_par_moi = serial is not None
+        else:
+            sans_fil = est_sans_fil(serial)
+        if serial is None:
+            sys.exit("Téléphone introuvable : ni câble USB, ni Wi-Fi (branche le câble ou fais adb connect IP:PORT).")
+        self.serie, self.sans_fil = serial, sans_fil
+        self.adb = ["adb", "-s", serial]
+        log("Téléphone en Wi-Fi" if sans_fil else "Téléphone en USB")
         self.png = False          # passe à True si la capture brute n'est pas lisible
         self.geo = None           # (largeur, hauteur, taille de l'en-tête) de la capture brute
         self.dims = None          # (largeur, hauteur) de la dernière capture complète
@@ -636,6 +727,22 @@ class Telephone:
         except (OSError, ValueError):
             pass
 
+    def liaison(self):
+        """En Wi-Fi, la liaison tombe quand le téléphone se verrouille ou change de réseau (le
+        port change) : on le retrouve avec adb-a54. True si le téléphone répond."""
+        if not self.sans_fil or any(s == self.serie for s, _ in appareils()):
+            return True
+        log("  liaison Wi-Fi perdue : je reconnecte le téléphone (adb-a54)")
+        serie = connecter_sans_fil()
+        if serie is None:
+            log("  reconnexion impossible (téléphone verrouillé ou hors du Wi-Fi ?)")
+            return False
+        if self.canal is not None:
+            self.canal.fermer()
+        self.serie, self.adb = serie, ["adb", "-s", serie]
+        self.canal, self.canal_essaye, self.relances, self.geo = None, False, 0, None
+        return True
+
     def shell(self, commande):
         try:
             return subprocess.run(self.adb + ["shell", commande], capture_output=True,
@@ -664,11 +771,11 @@ class Telephone:
         canal = self.video()
         if canal is not None:
             t0 = time.perf_counter()
-            img = canal.image_apres(time.monotonic())
-            if img is not None:
-                self.dims = (img.shape[1], img.shape[0])
+            petite = canal.image_apres(time.monotonic())
+            if petite is not None:
+                self.dims = (canal.w, canal.h)
                 self._chrono("video", t0)
-                return Ecran(img)
+                return Ecran(petite=petite, taille=self.dims)
         return self._screencap()
 
     def _screencap(self):
@@ -732,7 +839,8 @@ class Telephone:
         if self.canal is None and not self.canal_essaye and DOIGTS_SCRCPY:
             self.canal_essaye = True
             w, h = self.taille()
-            canal = CanalScrcpy(self.adb, w, h, video=VIDEO_SCRCPY)
+            canal = CanalScrcpy(self.adb, w, h, video=VIDEO_SCRCPY,
+                                debit=VIDEO_DEBIT_SANS_FIL if self.sans_fil else VIDEO_DEBIT)
             raison = canal.demarrer()
             if raison:
                 log(f"  doigts simulés indisponibles ({raison}) : touches par « input », sans dézoom automatique")
@@ -833,7 +941,10 @@ class Telephone:
     def echelle_jeu(self):
         """Résolution à laquelle le jeu dessine vraiment (0.5 = 50 %), d'après la taille de son
         image dans le téléphone. None si le jeu n'est pas affiché."""
-        sortie = self.shell(f"dumpsys SurfaceFlinger | grep 'SurfaceView.{JEU}' | grep -o 'w/h:[0-9]*x[0-9]*'")
+        sortie = self.shell(f"dumpsys window 2>/dev/null | grep -m1 mCurrentFocus; dumpsys SurfaceFlinger "
+                            f"| grep 'SurfaceView.{JEU}' | grep -o 'w/h:[0-9]*x[0-9]*'")
+        if JEU not in sortie.split("\n", 1)[0]:
+            return None             # caché derrière l'accueil : sa surface reste dans SurfaceFlinger
         tailles = re.findall(r"w/h:(\d+)x(\d+)", sortie)
         ecran = re.findall(r"(\d+)x(\d+)", self.shell("wm size"))
         if not tailles or not ecran:
@@ -926,6 +1037,8 @@ class Telephone:
         if self.canal is not None:
             self.canal.fermer()
             self.canal = None
+        if self.connecte_par_moi:
+            subprocess.run(["adb", "disconnect", self.serie], capture_output=True, timeout=20)
         if self.remettre_resolution and MEMO_RESOLUTION.exists():
             log("Je remets le jeu en résolution normale (il redémarre, ~15 s)…")
             try:
@@ -1473,12 +1586,24 @@ def lire_butin(ecran):
 def lire_degats(ecran):
     """« Dégâts généraux » (0 à 100) affichés en bas à droite pendant un combat, ou None."""
     w, h = ecran.w, ecran.h
-    roi = ecran.img[int(0.722 * h):int(0.780 * h), int(0.885 * w):int(0.956 * w)]
+    roi = ecran.zone(0.885 * w, 0.722 * h, 0.956 * w, 0.780 * h)
     lus = lire_chiffres(glyphes(roi, 0.042 * h))
     if not lus or min(s for _, s in lus) < 0.65:
         return None
     valeur = int("".join(c for c, _ in lus))
     return valeur if valeur <= 100 else None
+
+
+def etoiles(ecran):
+    """Étoiles gagnées (0 à 3), à gauche des « Dégâts généraux » : sombres tant qu'elles ne
+    sont pas gagnées, claires ensuite."""
+    w, h = ecran.w, ecran.h
+    n = 0
+    for fx in (0.8573, 0.8782, 0.8983):
+        z = ecran.zone((fx - 0.005) * w, 0.737 * h, (fx + 0.005) * w, 0.759 * h)
+        if z.size and float((cv2.cvtColor(z, cv2.COLOR_BGR2HSV)[..., 2] > 170).mean()) > 0.3:
+            n += 1
+    return n
 
 
 def lire_compteur(ecran, carte):
@@ -1503,7 +1628,7 @@ def en_combat(ecran, boite):
     """Vrai tant que le bouton rouge « Terminer la bataille » / « Abandonner » est là.
     Dès qu'il disparaît (écran de fin, village…), on ne touche plus rien au hasard."""
     x, y, w, h = boite
-    hsv = cv2.cvtColor(ecran.img[y:y + h, x:x + w], cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(ecran.zone(x, y, x + w, y + h), cv2.COLOR_BGR2HSV)
     teinte, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     return float((((teinte < 10) | (teinte > 170)) & (sat > 120) & (val > 90)).mean()) > 0.2
 
@@ -1958,7 +2083,8 @@ def vignette(tel):
     """Petite image grise et floue du milieu de l'écran : pour voir si la caméra a bougé."""
     w, h = tel.taille()
     ya, yb = int(0.15 * h), int(0.75 * h)
-    g = cv2.cvtColor(tel.capture_bande(ya, yb).img[ya:yb], cv2.COLOR_BGR2GRAY)
+    e = tel.capture_bande(ya, yb)
+    g = e.gris[int(ya * REDUCTION):int(yb * REDUCTION)]
     g = cv2.resize(g, (max(1, w // 8), max(1, (yb - ya) // 8)), interpolation=cv2.INTER_AREA)
     return cv2.GaussianBlur(g.astype(np.float32), (0, 0), 1.5)
 
@@ -2604,7 +2730,7 @@ def attendre_fin(tel, boite, delai=300, duree=None, debut=None):
     fin = time.monotonic() + delai
     ecran, essais, abandon = None, 0, False
     vitesse = Vitesse(tel)
-    degats, change, vu = None, time.monotonic(), None
+    degats, change, vu, prolonge = None, time.monotonic(), None, False
     while time.monotonic() < fin:
         ecran = tel.capture_bande(*bande_rouge(boite))
         maintenant = time.monotonic()
@@ -2613,13 +2739,23 @@ def attendre_fin(tel, boite, delai=300, duree=None, debut=None):
                 d = lire_degats(ecran)
                 if d is not None and d != degats:
                     degats, change = d, maintenant
-                fige = (CAPITULER_SI_FIGE and d is not None and d == degats
-                        and maintenant - change >= CAPITULER_SI_FIGE
+                presque = (degats is not None and degats >= SEUIL_ETOILE and not ecran.partielle
+                           and etoiles(ecran) == 0)
+                if presque and not prolonge:
+                    log(f"  {degats} % sans étoile : je laisse plus de temps pour le bonus de victoire")
+                elif prolonge and not presque:
+                    log(f"  étoile obtenue ({degats} %)")
+                prolonge = presque
+                limite_fige = CAPITULER_SI_FIGE and CAPITULER_SI_FIGE * (2 if presque else 1)
+                limite = duree and duree + (BONUS_ETOILE if presque else 0)
+                fige = (limite_fige and d is not None and d == degats
+                        and maintenant - change >= limite_fige
                         and maintenant - debut >= CAPITULER_APRES_MIN)
-                if fige or (duree and maintenant - debut >= duree):
+                if fige or (limite and maintenant - debut >= limite):
                     abandon = True
                     abandonner(tel, boite, f"dégâts figés à {degats} % depuis {maintenant - change:.0f} s"
-                               if fige else "durée atteinte")
+                               if fige else f"durée atteinte ({degats} %)" if degats is not None
+                               else "durée atteinte")
                     continue
             if not abandon:
                 vitesse.guetter(debut)
@@ -2727,6 +2863,32 @@ def recuperer(tel, nuit=False):
         pass
 
 
+def detecter_village(tel, delai=30):
+    """--auto : village principal (False) ou base des ouvriers (True), d'après les boutons à
+    l'écran au lancement ; None si rien de reconnu en `delai` secondes."""
+    principal = ("combat", "trouver_partie", "terminer_bataille", "suivant")
+    ouvriers = ("nuit/combat", "nuit/trouver")
+    fin = time.monotonic() + delai
+    while time.monotonic() < fin:
+        e = tel.capture()
+        scores = {}
+        for nom in (*principal, *ouvriers):
+            t = localiser(e, nom)
+            if t:
+                scores[nom] = t.score
+        if scores:
+            return max(scores, key=scores.get) in ouvriers
+        if lire_barre_nuit(e).valide:
+            return True
+        for nom in popups():                      # une fenêtre imprévue cache le village
+            p = localiser(e, nom)
+            if p:
+                tel.toucher((p.x, p.y))
+                break
+        time.sleep(0.5)
+    return None
+
+
 def boucle(tel, max_attaques, debug, nuit=False, duree=None):
     if nuit:
         manquants = [f"templates/{n}.png" for n in OBLIGATOIRES_NUIT if template(n) is None]
@@ -2740,8 +2902,7 @@ def boucle(tel, max_attaques, debug, nuit=False, duree=None):
     if nuit:
         log("Base des ouvriers" + (f", capitule au bout de {duree:g} s" if duree else ""))
     else:
-        log(f"Village principal : attaque si or + élixir + {POIDS_NOIR} × noir ≥ "
-            f"{BUTIN_MIN_TOTAL:,}".replace(",", " ") + (f", capitule au bout de {duree:g} s" if duree else ""))
+        log(f"Village principal : {regle_butin()}" + (f", capitule au bout de {duree:g} s" if duree else ""))
     faites = echecs = 0
     while not max_attaques or faites < max_attaques:
         try:
@@ -2758,6 +2919,8 @@ def boucle(tel, max_attaques, debug, nuit=False, duree=None):
             if echecs >= 5:
                 log("5 blocages d'affilée, j'arrête.")
                 break
+            if isinstance(tel, Telephone) and not tel.liaison():
+                continue
             if echecs >= 2 and isinstance(tel, Telephone):
                 log("  2 blocages de suite : je relance le jeu")   # connexion perdue, inactivité…
                 if not tel.relancer_jeu():
@@ -3715,18 +3878,32 @@ def lire_nombre(texte):
     return int(round(float(m.group(1)) * {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2)]))
 
 
+def arret_demande(*_):
+    raise KeyboardInterrupt
+
+
 def main():
-    global BUTIN_MIN_TOTAL
+    global BUTIN_MIN_TOTAL, CAPITULER_SI_FIGE
+    # Ctrl+C, l'appli Bot CoC ou la fin de la session KDE : arrêt propre dans tous les cas, même
+    # si le programme qui a lancé le bot ignorait Ctrl+C
+    signal.signal(signal.SIGINT, arret_demande)
+    signal.signal(signal.SIGTERM, arret_demande)
     p = argparse.ArgumentParser(description="Boucle d'attaques Clash of Clans (ADB + OpenCV).")
     p.add_argument("mode", nargs="?", default="run",
                    choices=["run", "test", "capture", "chiffres", "vues", "recalibrer", "resolution"])
     p.add_argument("nom", nargs="?", help="nom du template à créer (mode capture), ou 50 / 100 (mode resolution)")
     p.add_argument("--nuit", action="store_true", help="base des ouvriers (base de nuit) au lieu du village principal")
+    p.add_argument("--auto", action="store_true", help="village principal ou base des ouvriers : vu sur l'écran au lancement")
+    p.add_argument("--fige", type=float, default=None, metavar="SECONDES",
+                   help=f"capitule quand les dégâts n'ont pas bougé depuis ce temps (0 = jamais ; défaut {CAPITULER_SI_FIGE:g})")
     p.add_argument("--attaques", type=int, default=0, help="nombre d'attaques puis arrêt (0 = sans fin)")
     p.add_argument("--duree", type=float, default=None, metavar="SECONDES",
                    help="au bout de ce temps de combat, appuie sur Capituler / Terminer la bataille")
     p.add_argument("--butin", type=lire_nombre, default=None, metavar="TOTAL",
-                   help=f"butin minimum or + élixir + {POIDS_NOIR} × noir (défaut 2.2M)")
+                   help=f"butin minimum or + élixir + {POIDS_NOIR} × noir (défaut 2.2M, 0 = aucun)")
+    for r, nom in RESSOURCES.items():
+        p.add_argument(f"--{nom.replace('é', 'e')}", dest=r, type=lire_nombre, default=None, metavar="N",
+                       help=f"{nom} minimum, à la place du total (plusieurs : tous doivent être atteints)")
     p.add_argument("--image", help="utiliser une capture enregistrée au lieu du téléphone")
     p.add_argument("--vue", choices=["haut", "bas"], help="avec --image : la vue de cette capture (mode vues)")
     p.add_argument("--debug", action="store_true", help="enregistre l'analyse de chaque combat")
@@ -3741,8 +3918,13 @@ def main():
         p.error("avec --image, précise la vue de la capture : --vue haut ou --vue bas")
     if a.duree is not None and a.duree <= 0:
         p.error("--duree doit être un nombre de secondes positif, par ex. --duree 90")
+    BUTIN_MIN.update({r: getattr(a, r) for r in RESSOURCES if getattr(a, r) is not None})
     if a.butin is not None:
         BUTIN_MIN_TOTAL = a.butin
+    elif BUTIN_MIN:
+        BUTIN_MIN_TOTAL = 0
+    if a.fige is not None:
+        CAPITULER_SI_FIGE = a.fige or None
     if a.mode == "recalibrer":
         mode_recalibrer()
         return
@@ -3768,7 +3950,13 @@ def main():
                 mode_vues(tel, a.vue if a.image else None)
         else:
             tel.resolution_du_bot()
-            boucle(tel, a.attaques, a.debug, a.nuit, a.duree)
+            nuit = a.nuit
+            if a.auto:
+                nuit = detecter_village(tel)
+                if nuit is None:
+                    sys.exit("Village pas reconnu : ouvre le village principal ou la base des ouvriers, puis relance.")
+                log("Village détecté : " + ("base des ouvriers" if nuit else "village principal"))
+            boucle(tel, a.attaques, a.debug, nuit, a.duree)
     except KeyboardInterrupt:
         print()
         log("Arrêt demandé (Ctrl+C).")
