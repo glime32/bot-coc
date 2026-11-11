@@ -55,4 +55,20 @@ Needs `adb` and an Android phone with **USB debugging** on (or wireless debuggin
 .venv/bin/python bot_coc.py recalibrer       # probe the map edges again next battle
 ```
 
+## KDE app
+
+<p align="center"><img src="docs/bot-coc-appli.png" width="820" alt="Bot CoC app"></p>
+
+A window to start and watch the bot without a terminal (Rust + [cxx-qt](https://github.com/KDAB/cxx-qt) + Kirigami, French UI):
+
+- **Settings**: village (auto, home village or Builder Base), number of attacks, max battle time, delay without new damage before surrendering, minimum loot (total, or any choice of gold / elixir / dark elixir). They are remembered between runs.
+- **Monitoring**: live colored log (or just the current step), attack / "Next" / stuck counters, a notification when it finishes or gets stuck.
+- **Phone**: without a cable, it connects the phone over Wi-Fi on startup with an `adb-a54` script when one exists, and disconnects it on exit.
+- **Clean stop**: closing the window stops the bot. The log is followed with inotify: no wake-ups while the bot is quiet.
+
+```bash
+sudo pacman -S rust qt6-declarative kirigami qqc2-breeze-style   # Arch / CachyOS
+cd appli && ./installer.sh        # builds it and adds "Bot CoC" to the application menu
+```
+
 Fan-made, not affiliated with or endorsed by Supercell.

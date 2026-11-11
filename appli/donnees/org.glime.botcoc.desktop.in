@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Bot CoC
+Comment=Lancer et suivre le bot Clash of Clans
+Exec=@BIN@
+Icon=org.glime.botcoc
+Terminal=false
+Categories=Game;Utility;
+StartupWMClass=bot-coc

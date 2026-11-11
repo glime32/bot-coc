@@ -55,4 +55,20 @@ Il faut `adb` et un téléphone Android avec le **débogage USB** (ou le déboga
 .venv/bin/python bot_coc.py recalibrer       # recherche les bords de la carte au prochain combat
 ```
 
+## Appli KDE
+
+<p align="center"><img src="docs/bot-coc-appli.png" width="820" alt="appli Bot CoC"></p>
+
+Une fenêtre pour lancer et suivre le bot sans terminal (Rust + [cxx-qt](https://github.com/KDAB/cxx-qt) + Kirigami) :
+
+- **Réglages** : village (auto, principal ou base des ouvriers), nombre d'attaques, durée max d'un combat, délai sans destruction avant de capituler, butin minimum (total, ou or / élixir / élixir noir au choix). Ils sont retenus d'une fois sur l'autre.
+- **Suivi** : journal en direct en couleurs (ou seulement l'étape en cours), compteurs d'attaques, de « Suivant » et de blocages, notification à la fin ou en cas de blocage.
+- **Téléphone** : sans câble, elle le connecte en Wi-Fi à l'ouverture avec un script `adb-a54` s'il existe, et le déconnecte à la fermeture.
+- **Arrêt propre** : fermer la fenêtre arrête le bot. Le journal est suivi par inotify : aucun réveil tant que le bot se tait.
+
+```bash
+sudo pacman -S rust qt6-declarative kirigami qqc2-breeze-style   # Arch / CachyOS
+cd appli && ./installer.sh        # compile et ajoute « Bot CoC » au menu des applications
+```
+
 Outil de fan, ni affilié ni approuvé par Supercell.

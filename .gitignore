@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 debug/
 templates/boutons.json
+appli/target/
+appli/.qmlls.ini
