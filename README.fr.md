@@ -24,7 +24,7 @@
 - **Léger pour le PC** : la vidéo est décodée à 10 images/s (environ 5 % d'un cœur en attente), et le bot tourne sur les cœurs économes d'un processeur Intel hybride (trouvés tout seuls, réglage `COEURS` en haut du script), jamais sur le premier cœur. Le serveur adb est déplacé sur les mêmes cœurs.
 - **Câble ou Wi-Fi** : le bot prend le téléphone branché en USB, sinon celui connecté en Wi-Fi (`adb connect`), avec une vidéo moins lourde (4 Mbit/s). Si la liaison Wi-Fi tombe, il la refait avec un script `adb-a54` s'il en trouve un.
 - **Mode auto** (`--auto`) : au lancement, il regarde l'écran et choisit tout seul entre le village principal et la base des ouvriers. Si Clash of Clans n'est pas au premier plan, il le lance.
-- **Base des ouvriers** (`--nuit`) : deux étapes, pose tout autour de la base adverse, compétence de chaque camp 5 s après sa pose, compétence du héros dès que sa jauge est pleine, et bouton ×4 touché seulement quand il affiche 1×.
+- **Base des ouvriers** (`--nuit`) : deux étapes, pose tout autour de la base adverse, compétence de chaque camp 5 s après sa pose, compétence du héros dès que sa jauge est pleine, et bouton ×4 touché seulement quand il affiche 1×. Chaque combat y est joué jusqu'au bout : `--duree` et `--fige` ne valent que pour le village principal, même en mode auto.
 
 <p align="center"><img src="docs/bot-coc-run.png" width="820" alt="exemple"><br><sub>exemple de sortie</sub></p>
 
@@ -70,5 +70,27 @@ Une fenêtre pour lancer et suivre le bot sans terminal (Rust + [cxx-qt](https:/
 sudo pacman -S rust qt6-declarative kirigami qqc2-breeze-style   # Arch / CachyOS
 cd appli && ./installer.sh        # compile et ajoute « Bot CoC » au menu des applications
 ```
+
+## Appli Android
+
+Le même bot, réécrit en Java, qui tourne **sur le téléphone lui-même** : plus besoin du PC ni d'adb pendant les attaques (dossier `android/`).
+
+- **Vision** : le partage d'écran d'Android (MediaProjection) en demi-résolution, une image fraîche seulement quand le bot en demande une, et rien du tout quand il est arrêté. OpenCV pour Android (seulement la partie arm64, ~10 Mo, téléchargée par `build.sh`). Comme `matchTemplate` n'y utilise qu'un cœur, la recherche d'un bouton passe d'abord au quart de la résolution, puis affine autour des meilleurs endroits, en essayant les tailles en parallèle.
+- **Doigts** : un service d'accessibilité (touches par paquets, glissements, pincement à deux doigts). Le bot ne touche que Clash of Clans : si une autre appli, le volet des notifications ou l'écran de verrouillage passe devant, il se met en pause.
+- **Pastille** par-dessus le jeu, en haut au centre : attaque en cours et état. Touchée, elle ouvre un panneau avec Lancer / Arrêter, les compteurs et les dernières lignes du journal. Arrêt aussi par la notification ou par un appui long sur volume bas.
+- **Batterie** : écran au minimum pendant que le bot joue, partage d'écran en veille dès qu'il s'arrête, service d'accessibilité coupé 2 min après avoir quitté le jeu et rallumé au lancement suivant.
+- **Réglages** : les mêmes que l'appli KDE, dans l'appli « Bot CoC ». Village principal et base des ouvriers, comme le bot du PC.
+
+```bash
+cd android && ./build.sh            # SDK Android (build-tools et plateforme 36) + Java 21, sans Gradle
+adb install -r build/bot-coc.apk
+# une seule fois, pour ne plus jamais avoir de fenêtre d'autorisation :
+adb shell appops set fr.glime.botcoc PROJECT_MEDIA allow                      # partage d'écran sans question
+adb shell pm grant fr.glime.botcoc android.permission.WRITE_SECURE_SETTINGS   # l'appli rallume son accessibilité
+# facultatif : jeu en 50 % et 30 images/s dans le mode « batterie » que Game Booster remet à chaque lancement
+adb shell cmd game set --mode 3 --downscale 0.5 --fps 30 com.supercell.clashofclans
+```
+
+Ouvre ensuite l'appli « Bot CoC », règle-la et touche « Lancer » : elle ouvre le jeu, la pastille et lance les attaques.
 
 Outil de fan, ni affilié ni approuvé par Supercell.

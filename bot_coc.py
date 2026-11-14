@@ -148,6 +148,7 @@ BUTIN_MIN_TOTAL = 2_200_000
 POIDS_NOIR = 120             # 1 élixir noir compte comme 120 or ou élixir
 BUTIN_MIN = {}               # par ressource, ex. {"or_": 1_000_000, "noir": 8_000}
 RESSOURCES = {"or_": "or", "elixir": "élixir", "noir": "noir"}
+BUTIN_MAX = 20_000_000       # au-delà, une lecture du butin est fausse (chiffres mal coupés)
 SUIVANTS_MAX = 30            # au-delà de 30 villages passés d'affilée, il attaque quand même
 
 # Doigts simulés par le serveur de scrcpy (gestes à deux doigts sans root, touches rapides).
@@ -1454,21 +1455,33 @@ def glyphes(roi, h_ref):
         k = int(round(w / lt)) if w > 1.45 * lt else 1
         if k == 1:
             sortie.append(mk)
-        else:                                            # chiffres collés : découpe aux creux
-            cols = mk.sum(axis=0).astype(float)
-            coupes = [0]
-            for j in range(1, k):
-                c = int(w * j / k)
-                a, b = max(1, c - int(0.25 * lt)), min(w - 1, c + int(0.25 * lt))
-                coupes.append(a + int(np.argmin(cols[a:b])) if b > a else c)
-            coupes.append(w)
-            for a, b in zip(coupes, coupes[1:]):
-                part = mk[:, a:b]
-                lignes = np.flatnonzero(part.any(axis=1))
-                if len(lignes):
-                    sortie.append(part[lignes[0]:lignes[-1] + 1])
+        else:
+            # chiffres collés : découpe aux creux, en k - 1, k ou k + 1 morceaux (deux « 0 » collés
+            # sont plus larges que deux chiffres moyens) ; on garde la découpe dont le morceau le
+            # moins ressemblant ressemble le plus à un caractère
+            essais = [_couper(mk, n, lt) for n in (k - 1, k, k + 1) if n >= 2]
+            sortie += max(essais, key=lambda parts: min((reconnaitre(m)[1] for m in parts), default=-1.0))
         fin_prec = x + w
     return sortie
+
+
+def _couper(mk, k, lt):
+    """Un masque de k caractères collés, coupé aux colonnes les plus creuses."""
+    w = mk.shape[1]
+    cols = mk.sum(axis=0).astype(float)
+    coupes = [0]
+    for j in range(1, k):
+        c = int(w * j / k)
+        a, b = max(1, c - int(0.25 * lt)), min(w - 1, c + int(0.25 * lt))
+        coupes.append(a + int(np.argmin(cols[a:b])) if b > a else c)
+    coupes.append(w)
+    parts = []
+    for a, b in zip(coupes, coupes[1:]):
+        part = mk[:, a:b]
+        lignes = np.flatnonzero(part.any(axis=1))
+        if len(lignes):
+            parts.append(part[lignes[0]:lignes[-1] + 1])
+    return parts
 
 
 def normaliser(mk):
@@ -1580,6 +1593,8 @@ def lire_butin(ecran):
             valeurs.append(0)                            # pas de ligne d'élixir noir
         else:
             return None
+    if max(valeurs[:2]) > BUTIN_MAX or valeurs[2] > BUTIN_MAX // 50:
+        return None                                      # lecture impossible : chiffres mal coupés
     return Butin(*valeurs)
 
 
@@ -1608,9 +1623,15 @@ def etoiles(ecran):
 
 def lire_compteur(ecran, carte):
     """Nombre affiché en haut d'une carte (« x50 » → 50), ou None (héros, engin de siège…).
-    La zone lue déborde au-dessus de la carte : une carte sélectionnée remonte un peu."""
+    La zone lue déborde au-dessus de la carte : une carte sélectionnée remonte un peu. Si le
+    décor au-dessus gêne (une tache claire de la taille des chiffres), on relit sans le débord."""
+    n = _lire_compteur(ecran, carte, 0.2)
+    return n if n is not None else _lire_compteur(ecran, carte, 0.05)
+
+
+def _lire_compteur(ecran, carte, haut):
     w, h = carte.x1 - carte.x0, carte.y1 - carte.y0
-    roi = ecran.img[max(0, carte.y0 - int(0.2 * h)):carte.y0 + int(0.3 * h),
+    roi = ecran.img[max(0, carte.y0 - int(haut * h)):carte.y0 + int(0.3 * h),
                     carte.x0 + int(0.25 * w):carte.x1]
     lus = [reconnaitre(m) for m in glyphes(roi, 0.2 * h)]
     for i, (c, s) in enumerate(lus):                     # le « x » puis les chiffres qui suivent
@@ -3956,7 +3977,7 @@ def main():
                 if nuit is None:
                     sys.exit("Village pas reconnu : ouvre le village principal ou la base des ouvriers, puis relance.")
                 log("Village détecté : " + ("base des ouvriers" if nuit else "village principal"))
-            boucle(tel, a.attaques, a.debug, nuit, a.duree)
+            boucle(tel, a.attaques, a.debug, nuit, None if nuit else a.duree)   # ouvriers : jusqu'au bout
     except KeyboardInterrupt:
         print()
         log("Arrêt demandé (Ctrl+C).")

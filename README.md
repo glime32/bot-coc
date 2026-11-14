@@ -24,7 +24,7 @@
 - **Light on the PC**: video is decoded at 10 fps (about 5 % of one core while waiting), and the bot runs on the efficiency cores of a hybrid Intel CPU (found automatically, `COEURS` setting at the top of the script), never on the first core. The adb server is moved to the same cores.
 - **USB or Wi-Fi**: the bot uses the phone plugged in over USB, otherwise the one connected over Wi-Fi (`adb connect`), with a lighter video stream (4 Mbit/s). If the Wi-Fi link drops, it reconnects with an `adb-a54` script when one is installed.
 - **Auto mode** (`--auto`): at startup it looks at the screen and picks the home village or the Builder Base by itself. If Clash of Clans isn't in the foreground, it launches it.
-- **Builder Base** (`--nuit`): two stages, deploys all around the enemy base, triggers each camp's ability 5 s after it lands, the hero ability whenever its gauge is full, and taps the ×4 speed button only when it shows 1×.
+- **Builder Base** (`--nuit`): two stages, deploys all around the enemy base, triggers each camp's ability 5 s after it lands, the hero ability whenever its gauge is full, and taps the ×4 speed button only when it shows 1×. Every Builder Base battle is played to the end: `--duree` and `--fige` only apply to the home village, even in auto mode.
 
 <p align="center"><img src="docs/bot-coc-run.png" width="820" alt="example run"><br><sub>example output</sub></p>
 
@@ -70,5 +70,27 @@ A window to start and watch the bot without a terminal (Rust + [cxx-qt](https://
 sudo pacman -S rust qt6-declarative kirigami qqc2-breeze-style   # Arch / CachyOS
 cd appli && ./installer.sh        # builds it and adds "Bot CoC" to the application menu
 ```
+
+## Android app
+
+The same bot, rewritten in Java, running **on the phone itself**: no PC and no adb needed during the attacks (`android/` folder, French UI).
+
+- **Vision**: Android screen sharing (MediaProjection) at half resolution, one fresh frame only when the bot asks for it, and nothing at all while it is stopped. OpenCV for Android (only the arm64 part, ~10 MB, downloaded by `build.sh`). Since `matchTemplate` only uses one core there, a button search first runs at quarter resolution, then refines around the best spots, trying the sizes in parallel.
+- **Fingers**: an accessibility service (batched taps, swipes, two-finger pinch). The bot only ever touches Clash of Clans: if another app, the notification shade or the lock screen comes up, it pauses.
+- **Floating pill** over the game, top center: current attack and state. Tap it for a panel with Start / Stop, the counters and the last log lines. It also stops from the notification or with a long press on volume down.
+- **Battery**: screen at minimum brightness while the bot plays, screen sharing paused as soon as it stops, accessibility service turned off 2 min after leaving the game and back on at the next start.
+- **Settings**: the same as the KDE app, in the "Bot CoC" app. Home village and Builder Base, like the PC bot.
+
+```bash
+cd android && ./build.sh            # Android SDK (build-tools and platform 36) + Java 21, no Gradle
+adb install -r build/bot-coc.apk
+# once, so there is never a permission prompt again:
+adb shell appops set fr.glime.botcoc PROJECT_MEDIA allow                      # screen sharing without asking
+adb shell pm grant fr.glime.botcoc android.permission.WRITE_SECURE_SETTINGS   # the app turns its accessibility back on
+# optional: game at 50 % and 30 fps in the "battery" mode Game Booster sets at every launch
+adb shell cmd game set --mode 3 --downscale 0.5 --fps 30 com.supercell.clashofclans
+```
+
+Then open the "Bot CoC" app, set it up and tap "Lancer": it opens the game, the pill and starts attacking.
 
 Fan-made, not affiliated with or endorsed by Supercell.
